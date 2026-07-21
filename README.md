@@ -16,6 +16,18 @@ Native ESP-IDF firmware for the Seeed Studio XIAO ESP32-C6 Soil Moisture Sensor,
 - Deep-sleep wake cycle with button wake
 - Sparse NVS checkpoints to limit flash wear
 - Host tests for platform-independent logic
+- External 2.4 GHz antenna selection matching the Seeed soil-sensor assembly
+
+## Hardware safety before first power
+
+1. Remove the AA battery before opening, flashing, or handling the board.
+2. Inspect the external antenna cable where it passes the soldered battery terminals. No terminal or solder point may press into, pierce, or abrade the antenna insulation.
+3. Re-route the antenna away from both battery contacts and add a durable insulating barrier before closing the case.
+4. Flash, monitor, and perform the first Zigbee join over USB with the AA battery removed.
+5. Install a fresh battery only after the case closes without pinching wires and the unit has passed the USB test.
+6. If a cell, board, or case becomes hot, disconnect power and retire the affected hardware until the electrical fault is identified.
+
+Firmware cannot protect against a direct mechanical short between a battery terminal and damaged antenna wiring.
 
 ## Build
 
@@ -43,6 +55,8 @@ idf.py -p /dev/ttyACM0 erase-flash flash monitor
 | Battery ADC | 0 |
 | Soil ADC | 1 |
 | Button / wake | 2 |
+| RF switch control enable, active low | 3 |
+| External antenna select, high | 14 |
 | Probe excitation, 200 kHz | 21 |
 | Yellow LED | 18 |
 | Green LED | 19 |
