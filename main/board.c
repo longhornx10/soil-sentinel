@@ -24,6 +24,7 @@ static const char *TAG = "board";
 
 #define RF_SWITCH_CONTROL_ENABLE_LEVEL 0
 #define RF_EXTERNAL_ANTENNA_LEVEL      1
+#define MANUAL_LED_PULSE_US            300000U
 #define SAMPLE_COUNT                   24
 
 static adc_oneshot_unit_handle_t s_adc;
@@ -166,6 +167,6 @@ void board_led_status(float moisture_pct, bool fault, bool manual)
     if (!manual) return;
     gpio_num_t pin = fault ? PIN_LED_RED : moisture_pct < 20.0f ? PIN_LED_RED : moisture_pct < 30.0f ? PIN_LED_YELLOW : PIN_LED_GREEN;
     gpio_set_level(pin, 1);
-    esp_rom_delay_us(80000);
+    esp_rom_delay_us(MANUAL_LED_PULSE_US);
     gpio_set_level(pin, 0);
 }
