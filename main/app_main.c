@@ -12,6 +12,7 @@
 
 #define NORMAL_ZIGBEE_WAIT_MS 20000U
 #define COMMISSIONING_WINDOW_MS 120000U
+#define REPORT_SETTLE_MS 750U
 #define PAIRING_RESULT_LED_MS 1200U
 #define USB_NO_BATTERY_THRESHOLD_MV 500.0f
 
@@ -57,13 +58,14 @@ void app_main(void)
         const uint32_t wait_ms = (manual || usb_without_battery) ? COMMISSIONING_WINDOW_MS : NORMAL_ZIGBEE_WAIT_MS;
         ESP_LOGI(TAG, "Zigbee commissioning/report window: %" PRIu32 " ms", wait_ms);
         if (zigbee_transport_wait_ready(wait_ms)) {
+            const bool paired_now = board_pairing_indicator_is_success();
             soil_diagnostics_t diag = {
                 .raw_mv = measurement.soil_mv,
                 .battery_mv = measurement.battery_mv,
                 .noise_mv = measurement.noise_mv,
             };
             (void)zigbee_transport_publish(&state, &diag);
-            vTaskDelay(pdMS_TO_TICKS(PAIRING_RESULT_LED_MS));
+            vTaskDelay(pdMS_TO_TICKS(paired_now ? PAIRING_RESULT_LED_MS : REPORT_SETTLE_MS));
             board_pairing_indicator_off();
         } else {
             const bool pairing_failed = board_pairing_indicator_is_searching();
