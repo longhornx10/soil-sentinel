@@ -227,6 +227,11 @@ bool board_pairing_indicator_is_searching(void)
     return s_pairing_led_state == PAIRING_LED_SEARCHING;
 }
 
+bool board_pairing_indicator_is_success(void)
+{
+    return s_pairing_led_state == PAIRING_LED_SUCCESS;
+}
+
 void board_pairing_indicator_success(void)
 {
     s_pairing_led_state = PAIRING_LED_SUCCESS;
