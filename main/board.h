@@ -13,3 +13,9 @@ esp_err_t board_init(void);
 esp_err_t board_measure(board_measurement_t *out);
 bool board_button_pressed(void);
 void board_led_status(float moisture_pct, bool fault, bool manual);
+
+esp_err_t board_pairing_indicator_start(void);
+bool board_pairing_indicator_is_searching(void);
+void board_pairing_indicator_success(void);
+void board_pairing_indicator_failure(void);
+void board_pairing_indicator_off(void);
