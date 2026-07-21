@@ -12,6 +12,7 @@
 
 #define NORMAL_ZIGBEE_WAIT_MS 20000U
 #define COMMISSIONING_WINDOW_MS 120000U
+#define PAIRING_RESULT_LED_MS 1200U
 #define USB_NO_BATTERY_THRESHOLD_MV 500.0f
 
 static const char *TAG = "soil-sentinel";
@@ -62,9 +63,16 @@ void app_main(void)
                 .noise_mv = measurement.noise_mv,
             };
             (void)zigbee_transport_publish(&state, &diag);
-            vTaskDelay(pdMS_TO_TICKS(750));
+            vTaskDelay(pdMS_TO_TICKS(PAIRING_RESULT_LED_MS));
+            board_pairing_indicator_off();
         } else {
+            const bool pairing_failed = board_pairing_indicator_is_searching();
             ESP_LOGW(TAG, "Zigbee unavailable after %" PRIu32 " ms; retaining state and backing off", wait_ms);
+            if (pairing_failed) {
+                board_pairing_indicator_failure();
+                vTaskDelay(pdMS_TO_TICKS(PAIRING_RESULT_LED_MS));
+                board_pairing_indicator_off();
+            }
             if (state.sample_interval_seconds < 3600) state.sample_interval_seconds = 3600;
         }
     }
