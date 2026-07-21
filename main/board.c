@@ -9,6 +9,8 @@
 #include "esp_adc/adc_cali_scheme.h"
 #include "esp_check.h"
 #include "esp_rom_sys.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 static const char *TAG = "board";
 
@@ -25,11 +27,44 @@ static const char *TAG = "board";
 #define RF_SWITCH_CONTROL_ENABLE_LEVEL 0
 #define RF_EXTERNAL_ANTENNA_LEVEL      1
 #define MANUAL_LED_PULSE_US            300000U
+#define PAIRING_BLINK_INTERVAL_MS      300U
 #define SAMPLE_COUNT                   24
+
+typedef enum {
+    PAIRING_LED_OFF = 0,
+    PAIRING_LED_SEARCHING,
+    PAIRING_LED_SUCCESS,
+    PAIRING_LED_FAILURE,
+} pairing_led_state_t;
 
 static adc_oneshot_unit_handle_t s_adc;
 static adc_cali_handle_t s_soil_cali;
 static adc_cali_handle_t s_battery_cali;
+static volatile pairing_led_state_t s_pairing_led_state = PAIRING_LED_OFF;
+static TaskHandle_t s_pairing_blink_task;
+
+static void set_leds(bool red, bool yellow, bool green)
+{
+    gpio_set_level(PIN_LED_RED, red ? 1 : 0);
+    gpio_set_level(PIN_LED_YELLOW, yellow ? 1 : 0);
+    gpio_set_level(PIN_LED_GREEN, green ? 1 : 0);
+}
+
+static void pairing_blink_task(void *arg)
+{
+    (void)arg;
+    bool red_on = false;
+
+    while (s_pairing_led_state == PAIRING_LED_SEARCHING) {
+        red_on = !red_on;
+        set_leds(red_on, false, false);
+        (void)ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(PAIRING_BLINK_INTERVAL_MS));
+    }
+
+    gpio_set_level(PIN_LED_RED, 0);
+    s_pairing_blink_task = NULL;
+    vTaskDelete(NULL);
+}
 
 static int compare_int(const void *a, const void *b)
 {
@@ -161,12 +196,54 @@ bool board_button_pressed(void)
 
 void board_led_status(float moisture_pct, bool fault, bool manual)
 {
-    gpio_set_level(PIN_LED_RED, 0);
-    gpio_set_level(PIN_LED_YELLOW, 0);
-    gpio_set_level(PIN_LED_GREEN, 0);
+    set_leds(false, false, false);
     if (!manual) return;
     gpio_num_t pin = fault ? PIN_LED_RED : moisture_pct < 20.0f ? PIN_LED_RED : moisture_pct < 30.0f ? PIN_LED_YELLOW : PIN_LED_GREEN;
     gpio_set_level(pin, 1);
     esp_rom_delay_us(MANUAL_LED_PULSE_US);
     gpio_set_level(pin, 0);
+}
+
+esp_err_t board_pairing_indicator_start(void)
+{
+    set_leds(false, false, false);
+    s_pairing_led_state = PAIRING_LED_SEARCHING;
+
+    if (s_pairing_blink_task) {
+        xTaskNotifyGive(s_pairing_blink_task);
+        return ESP_OK;
+    }
+
+    if (xTaskCreate(pairing_blink_task, "pair_led", 2048, NULL, 3, &s_pairing_blink_task) != pdPASS) {
+        s_pairing_led_state = PAIRING_LED_OFF;
+        s_pairing_blink_task = NULL;
+        return ESP_ERR_NO_MEM;
+    }
+    return ESP_OK;
+}
+
+bool board_pairing_indicator_is_searching(void)
+{
+    return s_pairing_led_state == PAIRING_LED_SEARCHING;
+}
+
+void board_pairing_indicator_success(void)
+{
+    s_pairing_led_state = PAIRING_LED_SUCCESS;
+    if (s_pairing_blink_task) xTaskNotifyGive(s_pairing_blink_task);
+    set_leds(false, false, true);
+}
+
+void board_pairing_indicator_failure(void)
+{
+    s_pairing_led_state = PAIRING_LED_FAILURE;
+    if (s_pairing_blink_task) xTaskNotifyGive(s_pairing_blink_task);
+    set_leds(false, true, false);
+}
+
+void board_pairing_indicator_off(void)
+{
+    s_pairing_led_state = PAIRING_LED_OFF;
+    if (s_pairing_blink_task) xTaskNotifyGive(s_pairing_blink_task);
+    set_leds(false, false, false);
 }
