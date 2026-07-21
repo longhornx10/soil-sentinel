@@ -19,7 +19,7 @@
 #define ENDPOINT_ID 1
 #define CUSTOM_DEVICE_ID 0xFFF0
 #define READY_BIT BIT0
-#define PRIMARY_CHANNEL_MASK ESP_ZIGBEE_TRANSCEIVER_ALL_CHANNELS_MASK
+#define PRIMARY_CHANNEL_MASK 0x07FFF800UL
 
 static const char *TAG = "zigbee";
 static EventGroupHandle_t s_events;
@@ -106,13 +106,28 @@ static esp_err_t create_device(void)
 
 static void zigbee_task(void *arg)
 {
-    esp_zigbee_config_t config = ESP_ZIGBEE_DEFAULT_CONFIG();
+    esp_zigbee_config_t config = {
+        .device_config = {
+            .device_type = EZB_NWK_DEVICE_TYPE_END_DEVICE,
+            .install_code_policy = false,
+            .zed_config = {
+                .ed_timeout = EZB_NWK_ED_TIMEOUT_16384MIN,
+                .keep_alive = 3000,
+            },
+        },
+        .platform_config = {
+            .storage_partition_name = "zb_storage",
+            .radio_config = {
+                .radio_mode = ESP_ZIGBEE_RADIO_MODE_NATIVE,
+            },
+        },
+    };
     ESP_ERROR_CHECK(esp_zigbee_init(&config));
-    ESP_ERROR_CHECK(ezb_bdb_set_primary_channel_set(PRIMARY_CHANNEL_MASK));
-    ESP_ERROR_CHECK(ezb_app_signal_add_handler(app_signal_handler));
+    ESP_ERROR_CHECK(esp_zigbee_err_to_esp(ezb_bdb_set_primary_channel_set(PRIMARY_CHANNEL_MASK)));
+    ESP_ERROR_CHECK(esp_zigbee_err_to_esp(ezb_app_signal_add_handler(app_signal_handler)));
     ESP_ERROR_CHECK(create_device());
     ESP_ERROR_CHECK(esp_zigbee_start(false));
-    esp_zigbee_launch_mainloop();
+    ESP_ERROR_CHECK(esp_zigbee_launch_mainloop());
     vTaskDelete(NULL);
 }
 
