@@ -62,7 +62,8 @@ void app_main(void)
         }
     }
 
-    /* Checkpoint only on report/event wakes to avoid routine flash writes. */
+    /* RTC memory retains every wake; flash checkpoints remain event-driven. */
+    storage_save_runtime(&state);
     if (state.should_report || manual) (void)storage_save_checkpoint(&state);
     enter_sleep(state.sample_interval_seconds ? state.sample_interval_seconds : policy.stable_sample_seconds);
 }
