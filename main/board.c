@@ -22,7 +22,9 @@ static const char *TAG = "board";
 #define PIN_LED_GREEN        GPIO_NUM_19
 #define PIN_LED_RED          GPIO_NUM_20
 
-#define SAMPLE_COUNT 24
+#define RF_SWITCH_CONTROL_ENABLE_LEVEL 0
+#define RF_EXTERNAL_ANTENNA_LEVEL      1
+#define SAMPLE_COUNT                   24
 
 static adc_oneshot_unit_handle_t s_adc;
 static adc_cali_handle_t s_soil_cali;
@@ -60,12 +62,28 @@ static float read_channel_mv(adc_channel_t channel, adc_cali_handle_t cali, floa
 
 esp_err_t board_init(void)
 {
+    /* Establish harmless levels before LEDC or status logic claims these pins. */
+    gpio_config_t safe_outputs = {
+        .pin_bit_mask = (1ULL << PIN_PROBE_POWER) |
+                        (1ULL << PIN_LED_YELLOW) |
+                        (1ULL << PIN_LED_GREEN) |
+                        (1ULL << PIN_LED_RED),
+        .mode = GPIO_MODE_OUTPUT,
+    };
+    ESP_RETURN_ON_ERROR(gpio_config(&safe_outputs), TAG, "safe output GPIO init failed");
+    ESP_RETURN_ON_ERROR(gpio_set_level(PIN_PROBE_POWER, 0), TAG, "failed to hold probe output low");
+    ESP_RETURN_ON_ERROR(gpio_set_level(PIN_LED_YELLOW, 0), TAG, "failed to hold yellow LED low");
+    ESP_RETURN_ON_ERROR(gpio_set_level(PIN_LED_GREEN, 0), TAG, "failed to hold green LED low");
+    ESP_RETURN_ON_ERROR(gpio_set_level(PIN_LED_RED, 0), TAG, "failed to hold red LED low");
+
+    /* Seeed Soil Moisture Sensor uses the XIAO external 2.4 GHz antenna. */
     gpio_config_t rf_enable = {
         .pin_bit_mask = 1ULL << PIN_RF_SWITCH_ENABLE,
         .mode = GPIO_MODE_OUTPUT,
     };
     ESP_RETURN_ON_ERROR(gpio_config(&rf_enable), TAG, "RF switch enable GPIO init failed");
-    gpio_set_level(PIN_RF_SWITCH_ENABLE, 0);
+    ESP_RETURN_ON_ERROR(gpio_set_level(PIN_RF_SWITCH_ENABLE, RF_SWITCH_CONTROL_ENABLE_LEVEL), TAG,
+                        "failed to enable RF switch control");
     esp_rom_delay_us(100000);
 
     gpio_config_t rf_select = {
@@ -73,13 +91,10 @@ esp_err_t board_init(void)
         .mode = GPIO_MODE_OUTPUT,
     };
     ESP_RETURN_ON_ERROR(gpio_config(&rf_select), TAG, "RF antenna select GPIO init failed");
-    gpio_set_level(PIN_RF_ANT_SELECT, 0); /* XIAO onboard ceramic antenna */
+    ESP_RETURN_ON_ERROR(gpio_set_level(PIN_RF_ANT_SELECT, RF_EXTERNAL_ANTENNA_LEVEL), TAG,
+                        "failed to select external RF antenna");
+    ESP_LOGI(TAG, "RF switch configured for external antenna");
 
-    gpio_config_t outputs = {
-        .pin_bit_mask = (1ULL << PIN_LED_YELLOW) | (1ULL << PIN_LED_GREEN) | (1ULL << PIN_LED_RED),
-        .mode = GPIO_MODE_OUTPUT,
-    };
-    ESP_RETURN_ON_ERROR(gpio_config(&outputs), TAG, "LED GPIO init failed");
     gpio_config_t button = {
         .pin_bit_mask = 1ULL << PIN_BUTTON,
         .mode = GPIO_MODE_INPUT,
