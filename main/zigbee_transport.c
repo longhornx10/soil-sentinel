@@ -1,5 +1,6 @@
 #include "zigbee_transport.h"
 
+#include "board.h"
 #include "esp_check.h"
 #include "esp_log.h"
 #include "esp_zigbee.h"
@@ -107,6 +108,10 @@ static bool app_signal_handler(const ezb_app_signal_t *signal)
 
         if (status == EZB_BDB_STATUS_SUCCESS) {
             if (factory_new) {
+                esp_err_t led_err = board_pairing_indicator_start();
+                if (led_err != ESP_OK) {
+                    ESP_LOGW(TAG, "failed to start pairing LED indicator: %s", esp_err_to_name(led_err));
+                }
                 (void)start_commissioning(EZB_BDB_MODE_NETWORK_STEERING, "factory-new device");
             } else {
                 ESP_LOGI(TAG, "restored existing Zigbee network state");
@@ -128,6 +133,7 @@ static bool app_signal_handler(const ezb_app_signal_t *signal)
                      "joined Zigbee network: PAN=0x%04x EXT=0x%016llx channel=%u short=0x%04x",
                      ezb_nwk_get_panid(), (unsigned long long)extended_pan_id.u64,
                      (unsigned)ezb_nwk_get_current_channel(), ezb_nwk_get_short_address());
+            board_pairing_indicator_success();
             xEventGroupSetBits(s_events, READY_BIT);
         } else {
             ESP_LOGW(TAG, "network steering failed with status=0x%02x", (unsigned)status);
