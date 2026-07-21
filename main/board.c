@@ -12,13 +12,15 @@
 
 static const char *TAG = "board";
 
-#define PIN_BATTERY       GPIO_NUM_0
-#define PIN_SOIL          GPIO_NUM_1
-#define PIN_BUTTON        GPIO_NUM_2
-#define PIN_PROBE_POWER   GPIO_NUM_21
-#define PIN_LED_YELLOW    GPIO_NUM_18
-#define PIN_LED_GREEN     GPIO_NUM_19
-#define PIN_LED_RED       GPIO_NUM_20
+#define PIN_BATTERY          GPIO_NUM_0
+#define PIN_SOIL             GPIO_NUM_1
+#define PIN_BUTTON           GPIO_NUM_2
+#define PIN_RF_SWITCH_ENABLE GPIO_NUM_3
+#define PIN_RF_ANT_SELECT    GPIO_NUM_14
+#define PIN_PROBE_POWER      GPIO_NUM_21
+#define PIN_LED_YELLOW       GPIO_NUM_18
+#define PIN_LED_GREEN        GPIO_NUM_19
+#define PIN_LED_RED          GPIO_NUM_20
 
 #define SAMPLE_COUNT 24
 
@@ -58,6 +60,21 @@ static float read_channel_mv(adc_channel_t channel, adc_cali_handle_t cali, floa
 
 esp_err_t board_init(void)
 {
+    gpio_config_t rf_enable = {
+        .pin_bit_mask = 1ULL << PIN_RF_SWITCH_ENABLE,
+        .mode = GPIO_MODE_OUTPUT,
+    };
+    ESP_RETURN_ON_ERROR(gpio_config(&rf_enable), TAG, "RF switch enable GPIO init failed");
+    gpio_set_level(PIN_RF_SWITCH_ENABLE, 0);
+    esp_rom_delay_us(100000);
+
+    gpio_config_t rf_select = {
+        .pin_bit_mask = 1ULL << PIN_RF_ANT_SELECT,
+        .mode = GPIO_MODE_OUTPUT,
+    };
+    ESP_RETURN_ON_ERROR(gpio_config(&rf_select), TAG, "RF antenna select GPIO init failed");
+    gpio_set_level(PIN_RF_ANT_SELECT, 0); /* XIAO onboard ceramic antenna */
+
     gpio_config_t outputs = {
         .pin_bit_mask = (1ULL << PIN_LED_YELLOW) | (1ULL << PIN_LED_GREEN) | (1ULL << PIN_LED_RED),
         .mode = GPIO_MODE_OUTPUT,
