@@ -1,10 +1,21 @@
 #include "storage.h"
 
 #include <string.h>
+#include "esp_attr.h"
 #include "nvs.h"
 #include "nvs_flash.h"
 
 #define NS "sentinel"
+#define RUNTIME_MAGIC 0x534F494Cu
+#define RUNTIME_VERSION 1u
+
+typedef struct {
+    uint32_t magic;
+    uint32_t version;
+    soil_state_t state;
+} retained_runtime_t;
+
+RTC_DATA_ATTR static retained_runtime_t s_runtime;
 
 esp_err_t storage_init(void)
 {
@@ -42,10 +53,25 @@ esp_err_t storage_load(soil_policy_t *policy, soil_state_t *state)
 {
     if (!policy || !state) return ESP_ERR_INVALID_ARG;
     *policy = soil_policy_default();
-    memset(state, 0, sizeof(*state));
     (void)read_blob("policy", policy, sizeof(*policy));
+
+    if (s_runtime.magic == RUNTIME_MAGIC && s_runtime.version == RUNTIME_VERSION) {
+        *state = s_runtime.state;
+        return ESP_OK;
+    }
+
+    memset(state, 0, sizeof(*state));
     (void)read_blob("state", state, sizeof(*state));
+    storage_save_runtime(state);
     return ESP_OK;
+}
+
+void storage_save_runtime(const soil_state_t *state)
+{
+    if (!state) return;
+    s_runtime.magic = RUNTIME_MAGIC;
+    s_runtime.version = RUNTIME_VERSION;
+    s_runtime.state = *state;
 }
 
 esp_err_t storage_save_policy(const soil_policy_t *policy)
