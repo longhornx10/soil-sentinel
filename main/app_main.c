@@ -10,6 +10,10 @@
 #include "esp_sleep.h"
 #include "esp_timer.h"
 
+#define NORMAL_ZIGBEE_WAIT_MS 20000U
+#define COMMISSIONING_WINDOW_MS 120000U
+#define USB_NO_BATTERY_THRESHOLD_MV 500.0f
+
 static const char *TAG = "soil-sentinel";
 
 static void enter_sleep(uint32_t seconds)
@@ -32,6 +36,7 @@ void app_main(void)
     board_measurement_t measurement;
     ESP_ERROR_CHECK(board_measure(&measurement));
     const bool manual = board_button_pressed() || esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT1;
+    const bool usb_without_battery = measurement.battery_mv < USB_NO_BATTERY_THRESHOLD_MV;
     soil_sample_t sample = {
         .raw_mv = measurement.soil_mv,
         .battery_mv = measurement.battery_mv,
@@ -48,7 +53,9 @@ void app_main(void)
 
     if (state.should_report) {
         ESP_ERROR_CHECK(zigbee_transport_start());
-        if (zigbee_transport_wait_ready(15000)) {
+        const uint32_t wait_ms = (manual || usb_without_battery) ? COMMISSIONING_WINDOW_MS : NORMAL_ZIGBEE_WAIT_MS;
+        ESP_LOGI(TAG, "Zigbee commissioning/report window: %" PRIu32 " ms", wait_ms);
+        if (zigbee_transport_wait_ready(wait_ms)) {
             soil_diagnostics_t diag = {
                 .raw_mv = measurement.soil_mv,
                 .battery_mv = measurement.battery_mv,
@@ -57,7 +64,7 @@ void app_main(void)
             (void)zigbee_transport_publish(&state, &diag);
             vTaskDelay(pdMS_TO_TICKS(750));
         } else {
-            ESP_LOGW(TAG, "Zigbee unavailable; retaining state and backing off");
+            ESP_LOGW(TAG, "Zigbee unavailable after %" PRIu32 " ms; retaining state and backing off", wait_ms);
             if (state.sample_interval_seconds < 3600) state.sample_interval_seconds = 3600;
         }
     }
