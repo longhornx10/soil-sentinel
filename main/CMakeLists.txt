@@ -1,0 +1,17 @@
+idf_component_register(
+    SRCS
+        "app_main.c"
+        "board.c"
+        "storage.c"
+        "zigbee_transport.c"
+        "../core/src/soil_model.c"
+    INCLUDE_DIRS
+        "."
+        "../core/include"
+    REQUIRES
+        esp_adc
+        driver
+        nvs_flash
+        esp_timer
+        esp_system
+)
