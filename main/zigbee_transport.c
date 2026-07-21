@@ -8,6 +8,7 @@
 #include "freertos/event_groups.h"
 #include "freertos/task.h"
 #include "ezbee/af.h"
+#include "ezbee/app_signals.h"
 #include "ezbee/bdb.h"
 #include "ezbee/nwk.h"
 #include "ezbee/zcl/zcl_common.h"
@@ -22,9 +23,12 @@
 #define READY_BIT BIT0
 #define PRIMARY_CHANNEL_MASK 0x07FFF800UL
 #define ZIGBEE_STORAGE_PARTITION "zb_storage"
+#define COMMISSIONING_RETRY_DELAY_MS 1000U
 
 static const char *TAG = "zigbee";
 static EventGroupHandle_t s_events;
+static volatile bool s_retry_pending;
+static ezb_bdb_comm_mode_mask_t s_retry_mode;
 
 static esp_err_t init_zigbee_storage(void)
 {
@@ -37,31 +41,109 @@ static esp_err_t init_zigbee_storage(void)
     return err;
 }
 
+static ezb_err_t start_commissioning(ezb_bdb_comm_mode_mask_t mode, const char *reason)
+{
+    const ezb_err_t err = ezb_bdb_start_top_level_commissioning(mode);
+    if (err == EZB_ERR_NONE) {
+        ESP_LOGI(TAG, "started BDB commissioning mode=0x%02x (%s)", (unsigned)mode, reason);
+    } else {
+        ESP_LOGE(TAG, "failed to start BDB commissioning mode=0x%02x (%s), error=0x%04x",
+                 (unsigned)mode, reason, (unsigned)err);
+    }
+    return err;
+}
+
+static void commissioning_retry_task(void *arg)
+{
+    (void)arg;
+    vTaskDelay(pdMS_TO_TICKS(COMMISSIONING_RETRY_DELAY_MS));
+
+    const ezb_bdb_comm_mode_mask_t mode = s_retry_mode;
+    esp_zigbee_lock_acquire(portMAX_DELAY);
+    const ezb_err_t err = start_commissioning(mode, "scheduled retry");
+    esp_zigbee_lock_release();
+
+    s_retry_pending = false;
+    if (err != EZB_ERR_NONE) {
+        ESP_LOGW(TAG, "commissioning retry request was rejected; waiting for the next stack signal");
+    }
+    vTaskDelete(NULL);
+}
+
+static void schedule_commissioning_retry(ezb_bdb_comm_mode_mask_t mode)
+{
+    if (s_retry_pending) {
+        return;
+    }
+
+    s_retry_mode = mode;
+    s_retry_pending = true;
+    if (xTaskCreate(commissioning_retry_task, "zb_retry", 3072, NULL, 4, NULL) != pdPASS) {
+        s_retry_pending = false;
+        ESP_LOGE(TAG, "failed to create Zigbee commissioning retry task");
+    } else {
+        ESP_LOGI(TAG, "scheduled BDB commissioning retry mode=0x%02x in %u ms",
+                 (unsigned)mode, COMMISSIONING_RETRY_DELAY_MS);
+    }
+}
+
 static bool app_signal_handler(const ezb_app_signal_t *signal)
 {
     const ezb_app_signal_type_t type = ezb_app_signal_get_type(signal);
+    const char *signal_name = ezb_app_signal_to_string(type);
+
     switch (type) {
     case EZB_ZDO_SIGNAL_SKIP_STARTUP:
-        ezb_bdb_start_top_level_commissioning(EZB_BDB_MODE_INITIALIZATION);
+        ESP_LOGI(TAG, "Zigbee signal: %s (0x%02x)", signal_name, (unsigned)type);
+        (void)start_commissioning(EZB_BDB_MODE_INITIALIZATION, "stack startup");
         break;
+
     case EZB_BDB_SIGNAL_DEVICE_FIRST_START:
     case EZB_BDB_SIGNAL_DEVICE_REBOOT: {
         const ezb_bdb_comm_status_t status = *(const ezb_bdb_comm_status_t *)ezb_app_signal_get_params(signal);
+        const bool factory_new = ezb_bdb_is_factory_new();
+        ESP_LOGI(TAG, "Zigbee signal: %s (0x%02x), status=0x%02x, factory_new=%s",
+                 signal_name, (unsigned)type, (unsigned)status, factory_new ? "yes" : "no");
+
         if (status == EZB_BDB_STATUS_SUCCESS) {
-            if (ezb_bdb_is_factory_new()) {
-                ezb_bdb_start_top_level_commissioning(EZB_BDB_MODE_NETWORK_STEERING);
+            if (factory_new) {
+                (void)start_commissioning(EZB_BDB_MODE_NETWORK_STEERING, "factory-new device");
             } else {
+                ESP_LOGI(TAG, "restored existing Zigbee network state");
                 xEventGroupSetBits(s_events, READY_BIT);
             }
+        } else {
+            ESP_LOGW(TAG, "Zigbee initialization failed with status=0x%02x", (unsigned)status);
+            schedule_commissioning_retry(EZB_BDB_MODE_INITIALIZATION);
         }
         break;
     }
+
     case EZB_BDB_SIGNAL_STEERING: {
         const ezb_bdb_comm_status_t status = *(const ezb_bdb_comm_status_t *)ezb_app_signal_get_params(signal);
-        if (status == EZB_BDB_STATUS_SUCCESS) xEventGroupSetBits(s_events, READY_BIT);
+        if (status == EZB_BDB_STATUS_SUCCESS) {
+            ezb_extpanid_t extended_pan_id;
+            ezb_nwk_get_extended_panid(&extended_pan_id);
+            ESP_LOGI(TAG,
+                     "joined Zigbee network: PAN=0x%04x EXT=0x%016llx channel=%u short=0x%04x",
+                     ezb_nwk_get_panid(), (unsigned long long)extended_pan_id.u64,
+                     (unsigned)ezb_nwk_get_current_channel(), ezb_nwk_get_short_address());
+            xEventGroupSetBits(s_events, READY_BIT);
+        } else {
+            ESP_LOGW(TAG, "network steering failed with status=0x%02x", (unsigned)status);
+            schedule_commissioning_retry(EZB_BDB_MODE_NETWORK_STEERING);
+        }
         break;
     }
+
+    case EZB_NWK_SIGNAL_PERMIT_JOIN_STATUS: {
+        const uint8_t duration = *(const uint8_t *)ezb_app_signal_get_params(signal);
+        ESP_LOGI(TAG, "permit-join status: duration=%u seconds", (unsigned)duration);
+        break;
+    }
+
     default:
+        ESP_LOGI(TAG, "Zigbee signal: %s (0x%02x)", signal_name, (unsigned)type);
         break;
     }
     return true;
@@ -119,6 +201,7 @@ static esp_err_t create_device(void)
 
 static void zigbee_task(void *arg)
 {
+    (void)arg;
     ESP_ERROR_CHECK(init_zigbee_storage());
 
     esp_zigbee_config_t config = {
@@ -141,6 +224,7 @@ static void zigbee_task(void *arg)
     ESP_ERROR_CHECK(esp_zigbee_err_to_esp(ezb_bdb_set_primary_channel_set(PRIMARY_CHANNEL_MASK)));
     ESP_ERROR_CHECK(esp_zigbee_err_to_esp(ezb_app_signal_add_handler(app_signal_handler)));
     ESP_ERROR_CHECK(create_device());
+    ESP_LOGI(TAG, "starting Zigbee stack; primary channel mask=0x%08lx", (unsigned long)PRIMARY_CHANNEL_MASK);
     ESP_ERROR_CHECK(esp_zigbee_start(false));
     ESP_ERROR_CHECK(esp_zigbee_launch_mainloop());
     vTaskDelete(NULL);
