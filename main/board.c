@@ -23,14 +23,15 @@ static const char *TAG = "board";
 #define SAMPLE_COUNT 24
 
 static adc_oneshot_unit_handle_t s_adc;
-static adc_cali_handle_t s_cali;
+static adc_cali_handle_t s_soil_cali;
+static adc_cali_handle_t s_battery_cali;
 
 static int compare_int(const void *a, const void *b)
 {
     return (*(const int *)a > *(const int *)b) - (*(const int *)a < *(const int *)b);
 }
 
-static float read_channel_mv(adc_channel_t channel, float *noise_mv)
+static float read_channel_mv(adc_channel_t channel, adc_cali_handle_t cali, float *noise_mv)
 {
     int values[SAMPLE_COUNT];
     for (size_t i = 0; i < SAMPLE_COUNT; ++i) {
@@ -42,11 +43,11 @@ static float read_channel_mv(adc_channel_t channel, float *noise_mv)
     for (size_t i = 3; i < SAMPLE_COUNT - 3; ++i) sum += values[i];
     const int raw = (int)(sum / (SAMPLE_COUNT - 6));
     int mv = 0;
-    if (s_cali && adc_cali_raw_to_voltage(s_cali, raw, &mv) == ESP_OK) {
+    if (cali && adc_cali_raw_to_voltage(cali, raw, &mv) == ESP_OK) {
         if (noise_mv) {
             int lo = 0, hi = 0;
-            adc_cali_raw_to_voltage(s_cali, values[3], &lo);
-            adc_cali_raw_to_voltage(s_cali, values[SAMPLE_COUNT - 4], &hi);
+            adc_cali_raw_to_voltage(cali, values[3], &lo);
+            adc_cali_raw_to_voltage(cali, values[SAMPLE_COUNT - 4], &hi);
             *noise_mv = (float)(hi - lo);
         }
         return (float)mv;
@@ -93,13 +94,16 @@ esp_err_t board_init(void)
     ESP_RETURN_ON_ERROR(adc_oneshot_config_channel(s_adc, ADC_CHANNEL_0, &chan_cfg), TAG, "battery ADC config failed");
     ESP_RETURN_ON_ERROR(adc_oneshot_config_channel(s_adc, ADC_CHANNEL_1, &chan_cfg), TAG, "soil ADC config failed");
 
-    adc_cali_curve_fitting_config_t cali_cfg = {
+    adc_cali_curve_fitting_config_t soil_cali_cfg = {
         .unit_id = ADC_UNIT_1,
         .chan = ADC_CHANNEL_1,
         .atten = ADC_ATTEN_DB_12,
         .bitwidth = ADC_BITWIDTH_DEFAULT,
     };
-    (void)adc_cali_create_scheme_curve_fitting(&cali_cfg, &s_cali);
+    adc_cali_curve_fitting_config_t battery_cali_cfg = soil_cali_cfg;
+    battery_cali_cfg.chan = ADC_CHANNEL_0;
+    (void)adc_cali_create_scheme_curve_fitting(&soil_cali_cfg, &s_soil_cali);
+    (void)adc_cali_create_scheme_curve_fitting(&battery_cali_cfg, &s_battery_cali);
     return ESP_OK;
 }
 
@@ -109,11 +113,11 @@ esp_err_t board_measure(board_measurement_t *out)
     ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, 174);
     ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
     esp_rom_delay_us(2500);
-    out->soil_mv = read_channel_mv(ADC_CHANNEL_1, &out->noise_mv);
+    out->soil_mv = read_channel_mv(ADC_CHANNEL_1, s_soil_cali, &out->noise_mv);
     ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, 0);
     ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
     esp_rom_delay_us(1000);
-    out->battery_mv = read_channel_mv(ADC_CHANNEL_0, NULL);
+    out->battery_mv = read_channel_mv(ADC_CHANNEL_0, s_battery_cali, NULL);
     return ESP_OK;
 }
 
