@@ -3,6 +3,7 @@
 #include "esp_check.h"
 #include "esp_log.h"
 #include "esp_zigbee.h"
+#include "nvs_flash.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "freertos/task.h"
@@ -20,9 +21,21 @@
 #define CUSTOM_DEVICE_ID 0xFFF0
 #define READY_BIT BIT0
 #define PRIMARY_CHANNEL_MASK 0x07FFF800UL
+#define ZIGBEE_STORAGE_PARTITION "zb_storage"
 
 static const char *TAG = "zigbee";
 static EventGroupHandle_t s_events;
+
+static esp_err_t init_zigbee_storage(void)
+{
+    esp_err_t err = nvs_flash_init_partition(ZIGBEE_STORAGE_PARTITION);
+    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_RETURN_ON_ERROR(nvs_flash_erase_partition(ZIGBEE_STORAGE_PARTITION), TAG,
+                            "failed to erase Zigbee NVS partition");
+        err = nvs_flash_init_partition(ZIGBEE_STORAGE_PARTITION);
+    }
+    return err;
+}
 
 static bool app_signal_handler(const ezb_app_signal_t *signal)
 {
@@ -106,6 +119,8 @@ static esp_err_t create_device(void)
 
 static void zigbee_task(void *arg)
 {
+    ESP_ERROR_CHECK(init_zigbee_storage());
+
     esp_zigbee_config_t config = {
         .device_config = {
             .device_type = EZB_NWK_DEVICE_TYPE_END_DEVICE,
@@ -116,7 +131,7 @@ static void zigbee_task(void *arg)
             },
         },
         .platform_config = {
-            .storage_partition_name = "zb_storage",
+            .storage_partition_name = ZIGBEE_STORAGE_PARTITION,
             .radio_config = {
                 .radio_mode = ESP_ZIGBEE_RADIO_MODE_NATIVE,
             },
