@@ -2,6 +2,7 @@
 #include <math.h>
 #include <stdio.h>
 #include "soil_model.h"
+#include "soil_telemetry.h"
 
 static soil_sample_t sample(float raw_mv, float battery_mv, float noise_mv)
 {
@@ -144,6 +145,29 @@ static void test_manual_sample_does_not_invent_elapsed_drying_rate(void)
     assert(fabsf(s.drying_rate_pct_per_hour) < 0.001f);
 }
 
+static void test_telemetry_flags_expose_validity_and_history(void)
+{
+    soil_state_t s = {
+        .event_flags = SOIL_EVENT_MANUAL | SOIL_EVENT_FAULT,
+        .current_sample_valid = true,
+        .has_valid_moisture = true,
+        .has_watered = false,
+    };
+
+    uint16_t flags = soil_telemetry_flags(&s);
+    assert((flags & SOIL_EVENT_MANUAL) != 0);
+    assert((flags & SOIL_EVENT_FAULT) != 0);
+    assert((flags & SOIL_TELEMETRY_STATUS_CURRENT_SAMPLE_VALID) != 0);
+    assert((flags & SOIL_TELEMETRY_STATUS_HAS_VALID_MOISTURE) != 0);
+    assert((flags & SOIL_TELEMETRY_STATUS_HAS_WATERED) == 0);
+
+    s.current_sample_valid = false;
+    s.has_watered = true;
+    flags = soil_telemetry_flags(&s);
+    assert((flags & SOIL_TELEMETRY_STATUS_CURRENT_SAMPLE_VALID) == 0);
+    assert((flags & SOIL_TELEMETRY_STATUS_HAS_WATERED) != 0);
+}
+
 int main(void)
 {
     test_calibration();
@@ -155,6 +179,7 @@ int main(void)
     test_hard_fault_preserves_last_valid_moisture();
     test_noisy_finite_sample_updates_with_zero_confidence();
     test_manual_sample_does_not_invent_elapsed_drying_rate();
+    test_telemetry_flags_expose_validity_and_history();
     puts("soil_model tests passed");
     return 0;
 }
