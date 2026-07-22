@@ -10,6 +10,11 @@ static float clampf(float value, float low, float high)
     return value;
 }
 
+static uint32_t saturating_add_u32(uint32_t value, uint32_t increment)
+{
+    return UINT32_MAX - value < increment ? UINT32_MAX : value + increment;
+}
+
 soil_policy_t soil_policy_default(void)
 {
     return (soil_policy_t){
@@ -20,10 +25,10 @@ soil_policy_t soil_policy_default(void)
         .report_delta_pct = 3.0f,
         .watering_delta_pct = 8.0f,
         .noise_fault_mv = 90.0f,
-        .heartbeat_seconds = 12u * 60u * 60u,
-        .stable_sample_seconds = 60u * 60u,
-        .drying_sample_seconds = 15u * 60u,
-        .near_dry_sample_seconds = 5u * 60u,
+        .heartbeat_seconds = 24u * 60u * 60u,
+        .stable_sample_seconds = 8u * 60u * 60u,
+        .drying_sample_seconds = 60u * 60u,
+        .near_dry_sample_seconds = 60u * 60u,
         .critical_sample_seconds = 15u * 60u,
         .watering_sample_seconds = 20u,
         .recent_water_sample_seconds = 5u * 60u,
@@ -60,72 +65,113 @@ void soil_model_step(const soil_policy_t *policy, const soil_sample_t *sample, s
 {
     if (!policy || !sample || !state) return;
 
+    const bool was_initialized = state->initialized;
+    const bool previous_fault = state->sensor_fault;
+    const bool previous_battery_present = state->battery_present;
+    const float previous_battery_pct = state->battery_pct;
+    const soil_mode_t previous_mode = state->mode;
+
     const float moisture = soil_calibrated_percent(sample->raw_mv, policy->dry_raw_mv, policy->wet_raw_mv);
-    const float battery = soil_battery_percent(sample->battery_mv);
     const bool calibration_fault = !isfinite(moisture);
     const bool electrical_fault = !isfinite(sample->raw_mv) || sample->raw_mv < 50.0f || sample->raw_mv > 3300.0f;
+    const bool hard_fault = calibration_fault || electrical_fault;
     const bool noise_fault = !isfinite(sample->noise_mv) || sample->noise_mv > policy->noise_fault_mv;
+    const bool fault_now = hard_fault || noise_fault;
 
     state->event_flags = SOIL_EVENT_NONE;
     state->should_report = false;
-    state->sensor_fault = calibration_fault || electrical_fault || noise_fault;
-    state->battery_pct = battery;
-    state->seconds_since_report += state->initialized ? state->sample_interval_seconds : 0u;
-    state->seconds_since_watering += state->initialized ? state->sample_interval_seconds : 0u;
+    state->battery_present = sample->battery_present;
+    state->seconds_since_report = saturating_add_u32(state->seconds_since_report, sample->elapsed_seconds);
+    state->seconds_since_watering = saturating_add_u32(state->seconds_since_watering, sample->elapsed_seconds);
 
-    if (state->sensor_fault) {
-        if (!state->initialized || state->mode != SOIL_MODE_SURVIVAL) state->event_flags |= SOIL_EVENT_FAULT;
-        state->mode = battery <= 8.0f ? SOIL_MODE_SURVIVAL : SOIL_MODE_CONSERVATION;
-        state->sample_interval_seconds = battery <= 8.0f ? 12u * 60u * 60u : 2u * 60u * 60u;
-        state->confidence_pct = 0.0f;
-        state->should_report = true;
+    if (sample->battery_present) {
+        state->battery_pct = soil_battery_percent(sample->battery_mv);
+    }
+
+    if (fault_now != previous_fault || (!was_initialized && fault_now)) {
+        state->event_flags |= SOIL_EVENT_FAULT;
+    }
+    state->sensor_fault = fault_now;
+
+    if (sample->battery_present) {
+        const bool battery_state_changed = !previous_battery_present ||
+                                           (previous_battery_pct > 20.0f && state->battery_pct <= 20.0f) ||
+                                           (previous_battery_pct > 8.0f && state->battery_pct <= 8.0f);
+        if (battery_state_changed) {
+            state->event_flags |= SOIL_EVENT_BATTERY;
+        }
+    }
+
+    if (hard_fault) {
         state->initialized = true;
+        state->confidence_pct = 0.0f;
+        state->mode = sample->battery_present && state->battery_pct <= 8.0f
+                          ? SOIL_MODE_SURVIVAL
+                          : SOIL_MODE_CONSERVATION;
+        state->sample_interval_seconds = state->mode == SOIL_MODE_SURVIVAL
+                                             ? 12u * 60u * 60u
+                                             : 6u * 60u * 60u;
+
+        if (state->seconds_since_report >= policy->heartbeat_seconds) {
+            state->event_flags |= SOIL_EVENT_HEARTBEAT;
+        }
+        if (sample->manual_sample) {
+            state->event_flags |= SOIL_EVENT_MANUAL;
+        }
+        state->should_report = state->event_flags != SOIL_EVENT_NONE;
+        if (state->should_report) state->seconds_since_report = 0;
         return;
     }
 
-    if (!state->initialized) {
-        memset(state, 0, sizeof(*state));
+    if (!was_initialized || !state->has_valid_moisture) {
         state->initialized = true;
+        state->has_valid_moisture = true;
         state->moisture_pct = moisture;
         state->previous_moisture_pct = moisture;
         state->last_reported_pct = moisture;
-        state->battery_pct = battery;
-        state->confidence_pct = clampf(100.0f - sample->noise_mv, 0.0f, 100.0f);
+        state->drying_rate_pct_per_hour = 0.0f;
+        state->confidence_pct = noise_fault ? 0.0f : clampf(100.0f - sample->noise_mv, 0.0f, 100.0f);
         state->mode = moisture <= policy->critical_threshold_pct ? SOIL_MODE_CRITICAL
                     : moisture <= policy->dry_threshold_pct ? SOIL_MODE_NEAR_DRY
                     : SOIL_MODE_STABLE;
         state->sample_interval_seconds = state->mode == SOIL_MODE_CRITICAL ? policy->critical_sample_seconds
                                        : state->mode == SOIL_MODE_NEAR_DRY ? policy->near_dry_sample_seconds
                                        : policy->stable_sample_seconds;
-        state->event_flags = SOIL_EVENT_HEARTBEAT;
+        state->event_flags |= SOIL_EVENT_HEARTBEAT;
+        if (sample->manual_sample) state->event_flags |= SOIL_EVENT_MANUAL;
         state->should_report = true;
+        state->seconds_since_report = 0;
         return;
     }
 
     state->previous_moisture_pct = state->moisture_pct;
     state->moisture_pct = moisture;
     const float delta = moisture - state->previous_moisture_pct;
-    const float hours = state->sample_interval_seconds > 0 ? state->sample_interval_seconds / 3600.0f : 1.0f;
-    const float instantaneous_rate = -delta / hours;
-    state->drying_rate_pct_per_hour = 0.75f * state->drying_rate_pct_per_hour + 0.25f * instantaneous_rate;
-    state->confidence_pct = clampf(100.0f - sample->noise_mv * 0.8f, 0.0f, 100.0f);
+
+    if (sample->elapsed_seconds > 0) {
+        const float hours = sample->elapsed_seconds / 3600.0f;
+        const float instantaneous_rate = -delta / hours;
+        state->drying_rate_pct_per_hour = 0.75f * state->drying_rate_pct_per_hour + 0.25f * instantaneous_rate;
+    }
+    state->confidence_pct = noise_fault ? 0.0f : clampf(100.0f - sample->noise_mv * 0.8f, 0.0f, 100.0f);
 
     if (delta >= policy->watering_delta_pct) {
         state->mode = SOIL_MODE_WATERING_CAPTURE;
         state->sample_interval_seconds = policy->watering_sample_seconds;
         state->seconds_since_watering = 0;
         state->event_flags |= SOIL_EVENT_WATERING;
-    } else if (state->mode == SOIL_MODE_WATERING_CAPTURE) {
+    } else if (previous_mode == SOIL_MODE_WATERING_CAPTURE) {
         state->mode = SOIL_MODE_RECENTLY_WATERED;
         state->sample_interval_seconds = policy->recent_water_sample_seconds;
-    } else if (state->mode == SOIL_MODE_RECENTLY_WATERED && state->seconds_since_watering < 60u * 60u) {
+    } else if (previous_mode == SOIL_MODE_RECENTLY_WATERED && state->seconds_since_watering < 60u * 60u) {
+        state->mode = SOIL_MODE_RECENTLY_WATERED;
         state->sample_interval_seconds = policy->recent_water_sample_seconds;
     } else if (moisture <= policy->critical_threshold_pct) {
-        if (state->mode != SOIL_MODE_CRITICAL) state->event_flags |= SOIL_EVENT_THRESHOLD;
+        if (previous_mode != SOIL_MODE_CRITICAL) state->event_flags |= SOIL_EVENT_THRESHOLD;
         state->mode = SOIL_MODE_CRITICAL;
         state->sample_interval_seconds = policy->critical_sample_seconds;
     } else if (moisture <= policy->dry_threshold_pct) {
-        if (state->mode != SOIL_MODE_NEAR_DRY) state->event_flags |= SOIL_EVENT_THRESHOLD;
+        if (previous_mode != SOIL_MODE_NEAR_DRY) state->event_flags |= SOIL_EVENT_THRESHOLD;
         state->mode = SOIL_MODE_NEAR_DRY;
         state->sample_interval_seconds = policy->near_dry_sample_seconds;
     } else if (state->drying_rate_pct_per_hour > 0.2f) {
@@ -136,19 +182,23 @@ void soil_model_step(const soil_policy_t *policy, const soil_sample_t *sample, s
         state->sample_interval_seconds = policy->stable_sample_seconds;
     }
 
-    if (battery <= 8.0f) {
+    if (sample->battery_present && state->battery_pct <= 8.0f) {
         state->mode = SOIL_MODE_SURVIVAL;
         state->sample_interval_seconds = 12u * 60u * 60u;
-        state->event_flags |= SOIL_EVENT_BATTERY;
-    } else if (battery <= 20.0f && state->mode == SOIL_MODE_STABLE) {
+    } else if (sample->battery_present && state->battery_pct <= 20.0f && state->mode == SOIL_MODE_STABLE) {
         state->mode = SOIL_MODE_CONSERVATION;
-        state->sample_interval_seconds = 2u * 60u * 60u;
-        state->event_flags |= SOIL_EVENT_BATTERY;
+        state->sample_interval_seconds = 12u * 60u * 60u;
     }
 
-    if (fabsf(moisture - state->last_reported_pct) >= policy->report_delta_pct) state->event_flags |= SOIL_EVENT_THRESHOLD;
-    if (state->seconds_since_report >= policy->heartbeat_seconds) state->event_flags |= SOIL_EVENT_HEARTBEAT;
-    if (sample->manual_sample) state->event_flags |= SOIL_EVENT_MANUAL;
+    if (fabsf(moisture - state->last_reported_pct) >= policy->report_delta_pct) {
+        state->event_flags |= SOIL_EVENT_THRESHOLD;
+    }
+    if (state->seconds_since_report >= policy->heartbeat_seconds) {
+        state->event_flags |= SOIL_EVENT_HEARTBEAT;
+    }
+    if (sample->manual_sample) {
+        state->event_flags |= SOIL_EVENT_MANUAL;
+    }
 
     state->should_report = state->event_flags != SOIL_EVENT_NONE;
     if (state->should_report) {
