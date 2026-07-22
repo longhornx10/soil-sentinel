@@ -14,5 +14,6 @@ idf_component_register(
         nvs_flash
         esp_timer
         esp_system
+        esp_hw_support
         espressif__esp-zigbee-lib
 )
