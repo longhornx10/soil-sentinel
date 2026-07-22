@@ -61,10 +61,9 @@ static void test_low_battery_survival(void)
     soil_state_t s = {0};
     soil_sample_t first = sample(2000, 1050, 5);
     soil_model_step(&p, &first, &s);
-    first.elapsed_seconds = s.sample_interval_seconds;
-    soil_model_step(&p, &first, &s);
     assert(s.mode == SOIL_MODE_SURVIVAL);
     assert(s.sample_interval_seconds == 12u * 60u * 60u);
+    assert((s.event_flags & SOIL_EVENT_BATTERY) != 0);
 }
 
 static void test_usb_without_battery_does_not_force_survival(void)
