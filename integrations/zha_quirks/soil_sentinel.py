@@ -51,6 +51,10 @@ class SoilSentinelTelemetryCluster(CustomCluster):
 
     TELEMETRY_SCHEMA_VERSION = 1
     TELEMETRY_PAYLOAD_LENGTH = 21
+    REPORT_REASON_MASK = 0x003F
+    STATUS_CURRENT_SAMPLE_VALID = 1 << 8
+    STATUS_HAS_VALID_MOISTURE = 1 << 9
+    STATUS_HAS_WATERED = 1 << 10
 
     class AttributeDefs(BaseAttributeDefs):
         """Device and locally-derived telemetry attributes."""
@@ -67,6 +71,9 @@ class SoilSentinelTelemetryCluster(CustomCluster):
         report_reason: Final = ZCLAttributeDef(id=0x0107, type=SoilSentinelEventFlags, access="r")
         sensor_fault: Final = ZCLAttributeDef(id=0x0108, type=t.Bool, access="r")
         battery_present: Final = ZCLAttributeDef(id=0x0109, type=t.Bool, access="r")
+        current_sample_valid: Final = ZCLAttributeDef(id=0x010A, type=t.Bool, access="r")
+        has_valid_moisture: Final = ZCLAttributeDef(id=0x010B, type=t.Bool, access="r")
+        has_watered: Final = ZCLAttributeDef(id=0x010C, type=t.Bool, access="r")
 
     def _update_attribute(self, attrid: int, value) -> None:
         """Decode the firmware's single low-power telemetry frame."""
@@ -82,12 +89,17 @@ class SoilSentinelTelemetryCluster(CustomCluster):
         ):
             return
 
+        flags = int.from_bytes(payload[2:4], "little")
+        current_sample_valid = bool(flags & self.STATUS_CURRENT_SAMPLE_VALID)
+        has_valid_moisture = bool(flags & self.STATUS_HAS_VALID_MOISTURE)
+        has_watered = bool(flags & self.STATUS_HAS_WATERED)
+
         self._update_attribute(
             self.AttributeDefs.operating_mode.id, SoilSentinelMode(payload[1])
         )
         self._update_attribute(
             self.AttributeDefs.report_reason.id,
-            SoilSentinelEventFlags(int.from_bytes(payload[2:4], "little")),
+            SoilSentinelEventFlags(flags & self.REPORT_REASON_MASK),
         )
         self._update_attribute(self.AttributeDefs.sensor_fault.id, bool(payload[4]))
         self._update_attribute(self.AttributeDefs.confidence.id, payload[5])
@@ -107,11 +119,19 @@ class SoilSentinelTelemetryCluster(CustomCluster):
             self.AttributeDefs.sample_interval.id,
             int.from_bytes(payload[12:16], "little"),
         )
-        self._update_attribute(
-            self.AttributeDefs.seconds_since_watering.id,
-            int.from_bytes(payload[16:20], "little"),
-        )
+        if has_watered:
+            self._update_attribute(
+                self.AttributeDefs.seconds_since_watering.id,
+                int.from_bytes(payload[16:20], "little"),
+            )
         self._update_attribute(self.AttributeDefs.battery_present.id, bool(payload[20]))
+        self._update_attribute(
+            self.AttributeDefs.current_sample_valid.id, current_sample_valid
+        )
+        self._update_attribute(
+            self.AttributeDefs.has_valid_moisture.id, has_valid_moisture
+        )
+        self._update_attribute(self.AttributeDefs.has_watered.id, has_watered)
 
 
 (
@@ -133,6 +153,28 @@ class SoilSentinelTelemetryCluster(CustomCluster):
         entity_type=EntityType.DIAGNOSTIC,
         translation_key="sensor_fault",
         fallback_name="Sensor fault",
+    )
+    .binary_sensor(
+        SoilSentinelTelemetryCluster.AttributeDefs.current_sample_valid.name,
+        SoilSentinelTelemetryCluster.cluster_id,
+        entity_type=EntityType.DIAGNOSTIC,
+        translation_key="current_sample_valid",
+        fallback_name="Current measurement valid",
+    )
+    .binary_sensor(
+        SoilSentinelTelemetryCluster.AttributeDefs.has_watered.name,
+        SoilSentinelTelemetryCluster.cluster_id,
+        entity_type=EntityType.DIAGNOSTIC,
+        translation_key="watering_observed",
+        fallback_name="Watering observed",
+    )
+    .binary_sensor(
+        SoilSentinelTelemetryCluster.AttributeDefs.has_valid_moisture.name,
+        SoilSentinelTelemetryCluster.cluster_id,
+        entity_type=EntityType.DIAGNOSTIC,
+        initially_disabled=True,
+        translation_key="valid_moisture_history",
+        fallback_name="Valid moisture history",
     )
     .sensor(
         SoilSentinelTelemetryCluster.AttributeDefs.confidence.name,
