@@ -27,6 +27,7 @@ typedef enum {
     SOIL_EVENT_HEARTBEAT = 1u << 3,
     SOIL_EVENT_BATTERY = 1u << 4,
     SOIL_EVENT_MANUAL = 1u << 5,
+    SOIL_EVENT_MODE = 1u << 6,
 } soil_event_flags_t;
 
 typedef struct {
