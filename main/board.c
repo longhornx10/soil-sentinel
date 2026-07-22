@@ -29,6 +29,10 @@ static const char *TAG = "board";
 #define MANUAL_LED_PULSE_US            300000U
 #define PAIRING_BLINK_INTERVAL_MS      300U
 #define SAMPLE_COUNT                   24
+#define SOIL_SETTLE_MS                 1000U
+#define SOIL_READING_COUNT             10U
+#define SOIL_READING_INTERVAL_MS       200U
+#define PROBE_PWM_DUTY                  174U
 
 typedef enum {
     PAIRING_LED_OFF = 0,
@@ -94,6 +98,35 @@ static float read_channel_mv(adc_channel_t channel, adc_cali_handle_t cali, floa
     }
     if (noise_mv) *noise_mv = (float)(values[SAMPLE_COUNT - 4] - values[3]);
     return raw * 3300.0f / 4095.0f;
+}
+
+static float read_settled_soil_mv(float *noise_mv)
+{
+    float sum_mv = 0.0f;
+    float min_mv = INFINITY;
+    float max_mv = -INFINITY;
+    float burst_noise_sum_mv = 0.0f;
+
+    for (size_t i = 0; i < SOIL_READING_COUNT; ++i) {
+        float burst_noise_mv = 0.0f;
+        const float sample_mv = read_channel_mv(ADC_CHANNEL_1, s_soil_cali, &burst_noise_mv);
+        sum_mv += sample_mv;
+        burst_noise_sum_mv += burst_noise_mv;
+        if (sample_mv < min_mv) min_mv = sample_mv;
+        if (sample_mv > max_mv) max_mv = sample_mv;
+
+        if (i + 1U < SOIL_READING_COUNT) {
+            vTaskDelay(pdMS_TO_TICKS(SOIL_READING_INTERVAL_MS));
+        }
+    }
+
+    if (noise_mv) {
+        const float between_reading_range_mv = max_mv - min_mv;
+        const float average_burst_noise_mv = burst_noise_sum_mv / (float)SOIL_READING_COUNT;
+        *noise_mv = fmaxf(between_reading_range_mv, average_burst_noise_mv);
+    }
+
+    return sum_mv / (float)SOIL_READING_COUNT;
 }
 
 esp_err_t board_init(void)
@@ -178,13 +211,18 @@ esp_err_t board_init(void)
 esp_err_t board_measure(board_measurement_t *out)
 {
     ESP_RETURN_ON_FALSE(out, ESP_ERR_INVALID_ARG, TAG, "measurement output is null");
-    ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, 174);
+
+    ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, PROBE_PWM_DUTY);
     ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
-    esp_rom_delay_us(2500);
-    out->soil_mv = read_channel_mv(ADC_CHANNEL_1, s_soil_cali, &out->noise_mv);
+
+    /* The capacitive front end needs time to charge and stabilize before the ADC is useful. */
+    vTaskDelay(pdMS_TO_TICKS(SOIL_SETTLE_MS));
+    out->soil_mv = read_settled_soil_mv(&out->noise_mv);
+
     ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, 0);
     ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
-    esp_rom_delay_us(1000);
+    vTaskDelay(pdMS_TO_TICKS(1));
+
     out->battery_mv = read_channel_mv(ADC_CHANNEL_0, s_battery_cali, NULL);
     return ESP_OK;
 }
