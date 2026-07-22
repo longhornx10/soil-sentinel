@@ -1,7 +1,6 @@
 #include <assert.h>
 #include <math.h>
 #include <stdio.h>
-#include <string.h>
 #include "soil_model.h"
 
 static soil_sample_t sample(float raw_mv, float battery_mv, float noise_mv)
@@ -25,10 +24,12 @@ static void test_power_policy_defaults(void)
 {
     const soil_policy_t p = soil_policy_default();
     assert(p.heartbeat_seconds == 24u * 60u * 60u);
-    assert(p.stable_sample_seconds == 8u * 60u * 60u);
+    assert(p.stable_sample_seconds == 4u * 60u * 60u);
     assert(p.drying_sample_seconds == 60u * 60u);
-    assert(p.near_dry_sample_seconds == 60u * 60u);
+    assert(p.near_dry_sample_seconds == 30u * 60u);
     assert(p.critical_sample_seconds == 15u * 60u);
+    assert(p.watering_sample_seconds == 2u * 60u);
+    assert(p.recent_water_sample_seconds == 10u * 60u);
 }
 
 static void test_watering_detection(void)
@@ -44,6 +45,14 @@ static void test_watering_detection(void)
     assert(s.mode == SOIL_MODE_WATERING_CAPTURE);
     assert((s.event_flags & SOIL_EVENT_WATERING) != 0);
     assert(s.sample_interval_seconds == p.watering_sample_seconds);
+    assert(s.has_watered);
+    assert(s.seconds_since_watering == 0);
+
+    soil_sample_t settled = sample(1800, 1450, 5);
+    settled.elapsed_seconds = p.watering_sample_seconds;
+    soil_model_step(&p, &settled, &s);
+    assert(s.mode == SOIL_MODE_RECENTLY_WATERED);
+    assert(s.seconds_since_watering == p.watering_sample_seconds);
 }
 
 static void test_low_battery_survival(void)
@@ -70,6 +79,7 @@ static void test_usb_without_battery_does_not_force_survival(void)
     assert(!s.battery_present);
     assert(s.mode != SOIL_MODE_SURVIVAL);
     assert(s.has_valid_moisture);
+    assert(s.current_sample_valid);
     assert(s.should_report);
 }
 
@@ -98,6 +108,7 @@ static void test_hard_fault_preserves_last_valid_moisture(void)
     soil_sample_t broken = sample(0, 1450, 5);
     soil_model_step(&p, &broken, &s);
     assert(s.sensor_fault);
+    assert(!s.current_sample_valid);
     assert(s.has_valid_moisture);
     assert(fabsf(s.moisture_pct - previous) < 0.01f);
     assert((s.event_flags & SOIL_EVENT_FAULT) != 0);
@@ -114,6 +125,7 @@ static void test_noisy_finite_sample_updates_with_zero_confidence(void)
     noisy.manual_sample = true;
     soil_model_step(&p, &noisy, &s);
     assert(s.sensor_fault);
+    assert(s.current_sample_valid);
     assert(s.moisture_pct > s.previous_moisture_pct);
     assert(s.confidence_pct == 0.0f);
     assert(s.should_report);
