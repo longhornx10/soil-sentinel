@@ -4,6 +4,7 @@
 #include "storage.h"
 #include "zigbee_transport.h"
 #include "soil_model.h"
+#include "soil_telemetry.h"
 #include "driver/gpio.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -61,6 +62,7 @@ static esp_err_t publish_with_retry(const soil_state_t *state, const board_measu
         .noise_mv = measurement->noise_mv,
     };
     soil_state_t reported_state = *state;
+    reported_state.event_flags = soil_telemetry_flags(&reported_state);
     if (!reported_state.current_sample_valid) {
         /* ZCL single precision represents unknown as NaN. Keep last-good state internally. */
         reported_state.moisture_pct = NAN;
@@ -164,6 +166,15 @@ static void stay_awake_for_usb(const soil_policy_t *policy, soil_state_t *state,
 
 void app_main(void)
 {
+    const esp_sleep_wakeup_cause_t wake_cause = esp_sleep_get_wakeup_cause();
+    const bool deep_sleep_wake = wake_cause == ESP_SLEEP_WAKEUP_TIMER ||
+                                 wake_cause == ESP_SLEEP_WAKEUP_EXT1;
+    const bool button_wake = wake_cause == ESP_SLEEP_WAKEUP_EXT1;
+    if (deep_sleep_wake) {
+        /* Routine battery wakes should not spend energy formatting informational logs. */
+        esp_log_level_set("*", ESP_LOG_WARN);
+    }
+
     ESP_ERROR_CHECK(storage_init());
     ESP_ERROR_CHECK(board_init());
 
@@ -171,10 +182,6 @@ void app_main(void)
     soil_state_t state;
     ESP_ERROR_CHECK(storage_load(&policy, &state));
 
-    const esp_sleep_wakeup_cause_t wake_cause = esp_sleep_get_wakeup_cause();
-    const bool deep_sleep_wake = wake_cause == ESP_SLEEP_WAKEUP_TIMER ||
-                                 wake_cause == ESP_SLEEP_WAKEUP_EXT1;
-    const bool button_wake = wake_cause == ESP_SLEEP_WAKEUP_EXT1;
     const uint64_t sample_rtc_us = esp_clk_rtc_time();
     uint32_t elapsed_seconds = deep_sleep_wake
                                    ? elapsed_seconds_between(sample_rtc_us, state.last_sample_rtc_us)
