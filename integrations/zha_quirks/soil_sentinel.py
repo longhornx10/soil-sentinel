@@ -50,7 +50,7 @@ class SoilSentinelTelemetryCluster(CustomCluster):
     ep_attribute = "soil_sentinel_telemetry"
 
     TELEMETRY_SCHEMA_VERSION = 1
-    TELEMETRY_PAYLOAD_LENGTH = 23
+    TELEMETRY_PAYLOAD_LENGTH = 21
 
     class AttributeDefs(BaseAttributeDefs):
         """Device and locally-derived telemetry attributes."""
@@ -67,8 +67,6 @@ class SoilSentinelTelemetryCluster(CustomCluster):
         report_reason: Final = ZCLAttributeDef(id=0x0107, type=SoilSentinelEventFlags, access="r")
         sensor_fault: Final = ZCLAttributeDef(id=0x0108, type=t.Bool, access="r")
         battery_present: Final = ZCLAttributeDef(id=0x0109, type=t.Bool, access="r")
-        sample_invalid: Final = ZCLAttributeDef(id=0x010A, type=t.Bool, access="r")
-        has_watered: Final = ZCLAttributeDef(id=0x010B, type=t.Bool, access="r")
 
     def _update_attribute(self, attrid: int, value) -> None:
         """Decode the firmware's single low-power telemetry frame."""
@@ -109,17 +107,11 @@ class SoilSentinelTelemetryCluster(CustomCluster):
             self.AttributeDefs.sample_interval.id,
             int.from_bytes(payload[12:16], "little"),
         )
-
-        has_watered = bool(payload[22])
-        self._update_attribute(self.AttributeDefs.has_watered.id, has_watered)
-        if has_watered:
-            self._update_attribute(
-                self.AttributeDefs.seconds_since_watering.id,
-                int.from_bytes(payload[16:20], "little"),
-            )
-
+        self._update_attribute(
+            self.AttributeDefs.seconds_since_watering.id,
+            int.from_bytes(payload[16:20], "little"),
+        )
         self._update_attribute(self.AttributeDefs.battery_present.id, bool(payload[20]))
-        self._update_attribute(self.AttributeDefs.sample_invalid.id, not bool(payload[21]))
 
 
 (
@@ -141,14 +133,6 @@ class SoilSentinelTelemetryCluster(CustomCluster):
         entity_type=EntityType.DIAGNOSTIC,
         translation_key="sensor_fault",
         fallback_name="Sensor fault",
-    )
-    .binary_sensor(
-        SoilSentinelTelemetryCluster.AttributeDefs.sample_invalid.name,
-        SoilSentinelTelemetryCluster.cluster_id,
-        device_class=BinarySensorDeviceClass.PROBLEM,
-        entity_type=EntityType.DIAGNOSTIC,
-        translation_key="sample_invalid",
-        fallback_name="Current sample invalid",
     )
     .sensor(
         SoilSentinelTelemetryCluster.AttributeDefs.confidence.name,
@@ -184,6 +168,7 @@ class SoilSentinelTelemetryCluster(CustomCluster):
         unit=UnitOfTime.SECONDS,
         device_class=SensorDeviceClass.DURATION,
         entity_type=EntityType.DIAGNOSTIC,
+        initially_disabled=True,
         translation_key="time_since_watering",
         fallback_name="Time since watering",
     )
@@ -222,14 +207,6 @@ class SoilSentinelTelemetryCluster(CustomCluster):
         initially_disabled=True,
         translation_key="battery_present",
         fallback_name="Battery present",
-    )
-    .binary_sensor(
-        SoilSentinelTelemetryCluster.AttributeDefs.has_watered.name,
-        SoilSentinelTelemetryCluster.cluster_id,
-        entity_type=EntityType.DIAGNOSTIC,
-        initially_disabled=True,
-        translation_key="watering_history_present",
-        fallback_name="Watering history present",
     )
     .add_to_registry()
 )
