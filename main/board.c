@@ -46,11 +46,36 @@ typedef enum {
     PAIRING_LED_FAILURE,
 } pairing_led_state_t;
 
+static const gpio_num_t s_sleep_held_outputs[] = {
+    PIN_RF_SWITCH_ENABLE,
+    PIN_RF_ANT_SELECT,
+    PIN_PROBE_POWER,
+    PIN_LED_YELLOW,
+    PIN_LED_GREEN,
+    PIN_LED_RED,
+};
+
 static adc_oneshot_unit_handle_t s_adc;
 static adc_cali_handle_t s_soil_cali;
 static adc_cali_handle_t s_battery_cali;
 static volatile pairing_led_state_t s_pairing_led_state = PAIRING_LED_OFF;
 static TaskHandle_t s_pairing_blink_task;
+
+static void release_sleep_output_holds(void)
+{
+    gpio_deep_sleep_hold_dis();
+    for (size_t i = 0; i < sizeof(s_sleep_held_outputs) / sizeof(s_sleep_held_outputs[0]); ++i) {
+        (void)gpio_hold_dis(s_sleep_held_outputs[i]);
+    }
+}
+
+static void hold_sleep_outputs(void)
+{
+    for (size_t i = 0; i < sizeof(s_sleep_held_outputs) / sizeof(s_sleep_held_outputs[0]); ++i) {
+        (void)gpio_hold_en(s_sleep_held_outputs[i]);
+    }
+    gpio_deep_sleep_hold_en();
+}
 
 static void set_leds(bool red, bool yellow, bool green)
 {
@@ -166,6 +191,9 @@ static esp_err_t read_settled_soil_mv(float *value_mv, float *noise_mv)
 
 esp_err_t board_init(void)
 {
+    /* Release only the output pads explicitly held by the previous deep-sleep cycle. */
+    release_sleep_output_holds();
+
     /* Establish harmless levels before LEDC or status logic claims these pins. */
     gpio_config_t safe_outputs = {
         .pin_bit_mask = (1ULL << PIN_PROBE_POWER) |
@@ -273,6 +301,11 @@ void board_prepare_sleep(void)
 {
     (void)set_probe_duty(0);
     set_leds(false, false, false);
+    (void)gpio_set_level(PIN_RF_SWITCH_ENABLE, RF_SWITCH_CONTROL_ENABLE_LEVEL);
+    (void)gpio_set_level(PIN_RF_ANT_SELECT, RF_EXTERNAL_ANTENNA_LEVEL);
+
+    /* Keep external circuits in known states while the digital GPIO domain is powered down. */
+    hold_sleep_outputs();
 }
 
 bool board_button_pressed(void)
