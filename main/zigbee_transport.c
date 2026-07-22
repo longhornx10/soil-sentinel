@@ -22,14 +22,41 @@
 #define ENDPOINT_ID 1
 #define CUSTOM_DEVICE_ID 0xFFF0
 #define READY_BIT BIT0
+#define REPORT_MOISTURE_CONFIRMED_BIT BIT1
+#define REPORT_BATTERY_CONFIRMED_BIT BIT2
+#define REPORT_MOISTURE_FAILED_BIT BIT3
+#define REPORT_BATTERY_FAILED_BIT BIT4
 #define PRIMARY_CHANNEL_MASK 0x07FFF800UL
 #define ZIGBEE_STORAGE_PARTITION "zb_storage"
 #define COMMISSIONING_RETRY_DELAY_MS 1000U
+#define REPORT_CONFIRM_TIMEOUT_MS 3000U
+#define BATTERY_CONFIRM_TIMEOUT_MS 1000U
+#define COORDINATOR_SHORT_ADDRESS 0x0000U
+#define COORDINATOR_ENDPOINT 1U
+#define AF_CONFIRM_SUCCESS 0x00U
 
 static const char *TAG = "zigbee";
 static EventGroupHandle_t s_events;
 static volatile bool s_retry_pending;
 static ezb_bdb_comm_mode_mask_t s_retry_mode;
+
+typedef struct {
+    EventBits_t success_bit;
+    EventBits_t failure_bit;
+    const char *name;
+} report_confirm_context_t;
+
+static report_confirm_context_t s_moisture_confirm = {
+    .success_bit = REPORT_MOISTURE_CONFIRMED_BIT,
+    .failure_bit = REPORT_MOISTURE_FAILED_BIT,
+    .name = "moisture",
+};
+
+static report_confirm_context_t s_battery_confirm = {
+    .success_bit = REPORT_BATTERY_CONFIRMED_BIT,
+    .failure_bit = REPORT_BATTERY_FAILED_BIT,
+    .name = "battery",
+};
 
 static esp_err_t init_zigbee_storage(void)
 {
@@ -251,14 +278,46 @@ bool zigbee_transport_wait_ready(uint32_t timeout_ms)
     return (bits & READY_BIT) != 0;
 }
 
-static ezb_err_t report_attribute(uint16_t cluster_id, uint16_t attr_id)
+static void report_confirm_callback(ezb_af_user_cnf_t *cnf, void *user_ctx)
+{
+    report_confirm_context_t *ctx = (report_confirm_context_t *)user_ctx;
+    if (!s_events || !cnf || !ctx) {
+        return;
+    }
+
+    if (cnf->status == AF_CONFIRM_SUCCESS) {
+        ESP_LOGI(TAG,
+                 "%s report confirmed: dst=0x%04x ep=%u cluster=0x%04x tsn=%u",
+                 ctx->name, cnf->dst_addr.u.short_addr, (unsigned)cnf->dst_ep,
+                 cnf->cluster_id, (unsigned)cnf->tsn);
+        xEventGroupSetBits(s_events, ctx->success_bit);
+    } else {
+        ESP_LOGW(TAG,
+                 "%s report transmission failed: status=0x%02x dst=0x%04x ep=%u cluster=0x%04x",
+                 ctx->name, (unsigned)cnf->status, cnf->dst_addr.u.short_addr,
+                 (unsigned)cnf->dst_ep, cnf->cluster_id);
+        xEventGroupSetBits(s_events, ctx->failure_bit);
+    }
+}
+
+static ezb_err_t report_attribute(uint16_t cluster_id,
+                                  uint16_t attr_id,
+                                  report_confirm_context_t *confirm_ctx)
 {
     ezb_zcl_report_attr_cmd_t command = {
         .cmd_ctrl = {
             .fc.direction = EZB_ZCL_CMD_DIRECTION_TO_CLI,
-            .dst_addr.addr_mode = EZB_ADDR_MODE_NONE,
+            .dst_addr = {
+                .addr_mode = EZB_ADDR_MODE_SHORT,
+                .u.short_addr = COORDINATOR_SHORT_ADDRESS,
+            },
+            .dst_ep = COORDINATOR_ENDPOINT,
             .src_ep = ENDPOINT_ID,
             .cluster_id = cluster_id,
+            .cnf_ctx = {
+                .cb = report_confirm_callback,
+                .user_ctx = confirm_ctx,
+            },
         },
         .payload = {.attr_id = attr_id},
     };
@@ -267,27 +326,80 @@ static ezb_err_t report_attribute(uint16_t cluster_id, uint16_t attr_id)
 
 esp_err_t zigbee_transport_publish(const soil_state_t *state, const soil_diagnostics_t *diag)
 {
-    if (!state || !diag) return ESP_ERR_INVALID_ARG;
+    if (!state || !diag || !s_events) return ESP_ERR_INVALID_ARG;
+
+    const EventBits_t report_bits = REPORT_MOISTURE_CONFIRMED_BIT |
+                                    REPORT_BATTERY_CONFIRMED_BIT |
+                                    REPORT_MOISTURE_FAILED_BIT |
+                                    REPORT_BATTERY_FAILED_BIT;
+    xEventGroupClearBits(s_events, report_bits);
+
     float moisture = state->moisture_pct;
     uint8_t battery_half_pct = (uint8_t)(state->battery_pct * 2.0f + 0.5f);
     uint8_t status_flags = state->sensor_fault ? 0x02 : (state->mode == SOIL_MODE_CRITICAL ? 0x01 : 0x00);
 
     esp_zigbee_lock_acquire(portMAX_DELAY);
-    ezb_zcl_status_t moisture_status = ezb_zcl_set_attr_value(
+    const ezb_zcl_status_t moisture_status = ezb_zcl_set_attr_value(
         ENDPOINT_ID, EZB_ZCL_CLUSTER_ID_ANALOG_INPUT, EZB_ZCL_CLUSTER_SERVER,
         EZB_ZCL_ATTR_ANALOG_INPUT_PRESENT_VALUE_ID, EZB_ZCL_STD_MANUF_CODE, &moisture, false);
-    ezb_zcl_status_t flags_status = ezb_zcl_set_attr_value(
+    const ezb_zcl_status_t flags_status = ezb_zcl_set_attr_value(
         ENDPOINT_ID, EZB_ZCL_CLUSTER_ID_ANALOG_INPUT, EZB_ZCL_CLUSTER_SERVER,
         EZB_ZCL_ATTR_ANALOG_INPUT_STATUS_FLAGS_ID, EZB_ZCL_STD_MANUF_CODE, &status_flags, false);
-    ezb_zcl_status_t battery_status = ezb_zcl_set_attr_value(
+    const ezb_zcl_status_t battery_status = ezb_zcl_set_attr_value(
         ENDPOINT_ID, EZB_ZCL_CLUSTER_ID_POWER_CONFIG, EZB_ZCL_CLUSTER_SERVER,
         EZB_ZCL_ATTR_POWER_CONFIG_BATTERY_PERCENTAGE_REMAINING_ID, EZB_ZCL_STD_MANUF_CODE, &battery_half_pct, false);
-    ezb_err_t report_status = report_attribute(EZB_ZCL_CLUSTER_ID_ANALOG_INPUT, EZB_ZCL_ATTR_ANALOG_INPUT_PRESENT_VALUE_ID);
-    (void)report_attribute(EZB_ZCL_CLUSTER_ID_POWER_CONFIG, EZB_ZCL_ATTR_POWER_CONFIG_BATTERY_PERCENTAGE_REMAINING_ID);
+    const ezb_err_t moisture_report_status = report_attribute(
+        EZB_ZCL_CLUSTER_ID_ANALOG_INPUT,
+        EZB_ZCL_ATTR_ANALOG_INPUT_PRESENT_VALUE_ID,
+        &s_moisture_confirm);
+    const ezb_err_t battery_report_status = report_attribute(
+        EZB_ZCL_CLUSTER_ID_POWER_CONFIG,
+        EZB_ZCL_ATTR_POWER_CONFIG_BATTERY_PERCENTAGE_REMAINING_ID,
+        &s_battery_confirm);
     esp_zigbee_lock_release();
 
-    ESP_LOGI(TAG, "publish moisture=%.1f battery=%.1f raw=%.0f noise=%.1f mode=%s",
-             state->moisture_pct, state->battery_pct, diag->raw_mv, diag->noise_mv, soil_mode_name(state->mode));
-    return (moisture_status == EZB_ZCL_STATUS_SUCCESS && flags_status == EZB_ZCL_STATUS_SUCCESS &&
-            battery_status == EZB_ZCL_STATUS_SUCCESS && report_status == EZB_ERR_NONE) ? ESP_OK : ESP_FAIL;
+    ESP_LOGI(TAG,
+             "queued coordinator report moisture=%.1f battery=%.1f raw=%.0f noise=%.1f mode=%s "
+             "attr=[0x%02x,0x%02x,0x%02x] request=[0x%04x,0x%04x]",
+             state->moisture_pct, state->battery_pct, diag->raw_mv, diag->noise_mv,
+             soil_mode_name(state->mode), (unsigned)moisture_status, (unsigned)flags_status,
+             (unsigned)battery_status, (unsigned)moisture_report_status,
+             (unsigned)battery_report_status);
+
+    if (moisture_status != EZB_ZCL_STATUS_SUCCESS ||
+        flags_status != EZB_ZCL_STATUS_SUCCESS ||
+        moisture_report_status != EZB_ERR_NONE) {
+        ESP_LOGE(TAG, "moisture report was rejected before transmission");
+        return ESP_FAIL;
+    }
+
+    const EventBits_t moisture_result = xEventGroupWaitBits(
+        s_events,
+        REPORT_MOISTURE_CONFIRMED_BIT | REPORT_MOISTURE_FAILED_BIT,
+        pdTRUE,
+        pdFALSE,
+        pdMS_TO_TICKS(REPORT_CONFIRM_TIMEOUT_MS));
+
+    if ((moisture_result & REPORT_MOISTURE_CONFIRMED_BIT) == 0 ||
+        (moisture_result & REPORT_MOISTURE_FAILED_BIT) != 0) {
+        ESP_LOGE(TAG, "moisture report was not confirmed within %u ms", REPORT_CONFIRM_TIMEOUT_MS);
+        return ESP_FAIL;
+    }
+
+    if (battery_status == EZB_ZCL_STATUS_SUCCESS && battery_report_status == EZB_ERR_NONE) {
+        const EventBits_t battery_result = xEventGroupWaitBits(
+            s_events,
+            REPORT_BATTERY_CONFIRMED_BIT | REPORT_BATTERY_FAILED_BIT,
+            pdTRUE,
+            pdFALSE,
+            pdMS_TO_TICKS(BATTERY_CONFIRM_TIMEOUT_MS));
+        if ((battery_result & REPORT_BATTERY_CONFIRMED_BIT) == 0 ||
+            (battery_result & REPORT_BATTERY_FAILED_BIT) != 0) {
+            ESP_LOGW(TAG, "battery report was not confirmed within %u ms", BATTERY_CONFIRM_TIMEOUT_MS);
+        }
+    } else {
+        ESP_LOGW(TAG, "battery attribute/report request unavailable; moisture delivery still succeeded");
+    }
+
+    return ESP_OK;
 }
