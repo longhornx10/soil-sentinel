@@ -27,6 +27,9 @@ static const char *TAG = "board";
 #define RF_SWITCH_CONTROL_ENABLE_LEVEL 0
 #define RF_EXTERNAL_ANTENNA_LEVEL      1
 #define MANUAL_LED_PULSE_US            300000U
+#define MANUAL_FAULT_BLINK_US          100000U
+#define MANUAL_FAULT_BLINK_GAP_US      100000U
+#define MANUAL_FAULT_BLINK_COUNT       3U
 #define PAIRING_BLINK_INTERVAL_MS      300U
 #define SAMPLE_COUNT                   24
 #define SOIL_SETTLE_MS                 1000U
@@ -236,10 +239,30 @@ void board_led_status(float moisture_pct, bool fault, bool manual)
 {
     set_leds(false, false, false);
     if (!manual) return;
-    gpio_num_t pin = fault ? PIN_LED_RED : moisture_pct < 20.0f ? PIN_LED_RED : moisture_pct < 30.0f ? PIN_LED_YELLOW : PIN_LED_GREEN;
+
+    if (!isfinite(moisture_pct)) {
+        for (size_t i = 0; i < MANUAL_FAULT_BLINK_COUNT; ++i) {
+            gpio_set_level(PIN_LED_RED, 1);
+            esp_rom_delay_us(MANUAL_FAULT_BLINK_US);
+            gpio_set_level(PIN_LED_RED, 0);
+            if (i + 1U < MANUAL_FAULT_BLINK_COUNT) {
+                esp_rom_delay_us(MANUAL_FAULT_BLINK_GAP_US);
+            }
+        }
+        return;
+    }
+
+    /* A finite manual reading always shows its moisture band. Diagnostic faults stay in telemetry. */
+    const gpio_num_t pin = moisture_pct < 20.0f ? PIN_LED_RED
+                           : moisture_pct < 30.0f ? PIN_LED_YELLOW
+                                                  : PIN_LED_GREEN;
     gpio_set_level(pin, 1);
     esp_rom_delay_us(MANUAL_LED_PULSE_US);
     gpio_set_level(pin, 0);
+
+    if (fault) {
+        ESP_LOGW(TAG, "manual LED showed moisture band while diagnostics flagged the sample");
+    }
 }
 
 esp_err_t board_pairing_indicator_start(void)
