@@ -1,7 +1,6 @@
 #include "soil_model.h"
 
 #include <math.h>
-#include <string.h>
 
 static float clampf(float value, float low, float high)
 {
@@ -26,12 +25,12 @@ soil_policy_t soil_policy_default(void)
         .watering_delta_pct = 8.0f,
         .noise_fault_mv = 90.0f,
         .heartbeat_seconds = 24u * 60u * 60u,
-        .stable_sample_seconds = 8u * 60u * 60u,
+        .stable_sample_seconds = 4u * 60u * 60u,
         .drying_sample_seconds = 60u * 60u,
-        .near_dry_sample_seconds = 60u * 60u,
+        .near_dry_sample_seconds = 30u * 60u,
         .critical_sample_seconds = 15u * 60u,
-        .watering_sample_seconds = 20u,
-        .recent_water_sample_seconds = 5u * 60u,
+        .watering_sample_seconds = 2u * 60u,
+        .recent_water_sample_seconds = 10u * 60u,
     };
 }
 
@@ -80,9 +79,12 @@ void soil_model_step(const soil_policy_t *policy, const soil_sample_t *sample, s
 
     state->event_flags = SOIL_EVENT_NONE;
     state->should_report = false;
+    state->current_sample_valid = !hard_fault;
     state->battery_present = sample->battery_present;
     state->seconds_since_report = saturating_add_u32(state->seconds_since_report, sample->elapsed_seconds);
-    state->seconds_since_watering = saturating_add_u32(state->seconds_since_watering, sample->elapsed_seconds);
+    if (state->has_watered) {
+        state->seconds_since_watering = saturating_add_u32(state->seconds_since_watering, sample->elapsed_seconds);
+    }
 
     if (sample->battery_present) {
         state->battery_pct = soil_battery_percent(sample->battery_mv);
@@ -158,6 +160,7 @@ void soil_model_step(const soil_policy_t *policy, const soil_sample_t *sample, s
     if (delta >= policy->watering_delta_pct) {
         state->mode = SOIL_MODE_WATERING_CAPTURE;
         state->sample_interval_seconds = policy->watering_sample_seconds;
+        state->has_watered = true;
         state->seconds_since_watering = 0;
         state->event_flags |= SOIL_EVENT_WATERING;
     } else if (previous_mode == SOIL_MODE_WATERING_CAPTURE) {
