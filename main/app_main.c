@@ -27,6 +27,7 @@ static const char *TAG = "soil-sentinel";
 static void enter_sleep(uint32_t seconds)
 {
     board_pairing_indicator_off();
+    board_prepare_sleep();
     esp_sleep_enable_timer_wakeup((uint64_t)seconds * 1000000ULL);
     esp_sleep_enable_ext1_wakeup(1ULL << GPIO_NUM_2, ESP_EXT1_WAKEUP_ANY_LOW);
     ESP_LOGI(TAG, "sleeping for %" PRIu32 " seconds", seconds);
@@ -52,12 +53,17 @@ static esp_err_t publish_with_retry(const soil_state_t *state, const board_measu
         .battery_mv = measurement->battery_mv,
         .noise_mv = measurement->noise_mv,
     };
+    soil_state_t reported_state = *state;
+    if (!reported_state.current_sample_valid) {
+        /* ZCL single precision represents unknown as NaN. Keep last-good state internally. */
+        reported_state.moisture_pct = NAN;
+    }
 
-    esp_err_t publish_err = zigbee_transport_publish(state, &diag);
+    esp_err_t publish_err = zigbee_transport_publish(&reported_state, &diag);
     if (publish_err != ESP_OK) {
         ESP_LOGW(TAG, "Zigbee report delivery failed; retrying once in %u ms", REPORT_RETRY_DELAY_MS);
         vTaskDelay(pdMS_TO_TICKS(REPORT_RETRY_DELAY_MS));
-        publish_err = zigbee_transport_publish(state, &diag);
+        publish_err = zigbee_transport_publish(&reported_state, &diag);
     }
 
     if (publish_err == ESP_OK) {
