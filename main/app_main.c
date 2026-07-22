@@ -16,7 +16,8 @@
 #define REPORT_SETTLE_MS 250U
 #define PAIRING_RESULT_LED_MS 1200U
 #define USB_NO_BATTERY_THRESHOLD_MV 500.0f
-#define USB_IDLE_DELAY_MS 60000U
+#define USB_BUTTON_POLL_MS 20U
+#define USB_BUTTON_DEBOUNCE_MS 30U
 
 static const char *TAG = "soil-sentinel";
 
@@ -28,11 +29,105 @@ static void enter_sleep(uint32_t seconds)
     esp_deep_sleep_start();
 }
 
-static void stay_awake_for_usb(void)
+static void log_sample(const soil_state_t *state, const board_measurement_t *measurement)
+{
+    ESP_LOGI(TAG, "moisture=%.1f%% battery=%.1f%% raw=%.0fmV noise=%.1fmV mode=%s report=%s",
+             state->moisture_pct, state->battery_pct, measurement->soil_mv, measurement->noise_mv,
+             soil_mode_name(state->mode), state->should_report ? "yes" : "no");
+}
+
+static esp_err_t publish_with_retry(const soil_state_t *state, const board_measurement_t *measurement)
+{
+    soil_diagnostics_t diag = {
+        .raw_mv = measurement->soil_mv,
+        .battery_mv = measurement->battery_mv,
+        .noise_mv = measurement->noise_mv,
+    };
+
+    esp_err_t publish_err = zigbee_transport_publish(state, &diag);
+    if (publish_err != ESP_OK) {
+        ESP_LOGW(TAG, "Zigbee report delivery failed; retrying once in %u ms", REPORT_RETRY_DELAY_MS);
+        vTaskDelay(pdMS_TO_TICKS(REPORT_RETRY_DELAY_MS));
+        publish_err = zigbee_transport_publish(state, &diag);
+    }
+
+    if (publish_err == ESP_OK) {
+        ESP_LOGI(TAG, "Zigbee moisture report delivery confirmed");
+    } else {
+        ESP_LOGE(TAG, "Zigbee moisture report delivery failed after retry");
+    }
+    return publish_err;
+}
+
+static void save_state(const soil_policy_t *policy, soil_state_t *state, bool manual, esp_err_t publish_err)
+{
+    if (publish_err != ESP_OK) {
+        /* Force another report attempt instead of treating this sample as delivered. */
+        state->seconds_since_report = policy->heartbeat_seconds;
+    }
+    storage_save_runtime(state);
+    if (state->should_report || manual) {
+        (void)storage_save_checkpoint(state);
+    }
+}
+
+static void stay_awake_for_usb(const soil_policy_t *policy, soil_state_t *state, bool zigbee_ready)
 {
     ESP_LOGI(TAG, "USB bench mode: no battery detected; staying awake for monitor and flashing");
+    ESP_LOGI(TAG, "USB bench mode: press the large sensor button for a fresh sample and Zigbee report");
+
     while (true) {
-        vTaskDelay(pdMS_TO_TICKS(USB_IDLE_DELAY_MS));
+        if (!board_button_pressed()) {
+            vTaskDelay(pdMS_TO_TICKS(USB_BUTTON_POLL_MS));
+            continue;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(USB_BUTTON_DEBOUNCE_MS));
+        if (!board_button_pressed()) {
+            continue;
+        }
+
+        /* One action per press. Wait for release before measuring. */
+        while (board_button_pressed()) {
+            vTaskDelay(pdMS_TO_TICKS(USB_BUTTON_POLL_MS));
+        }
+
+        ESP_LOGI(TAG, "USB bench button pressed; taking a fresh manual sample");
+
+        board_measurement_t measurement;
+        esp_err_t measure_err = board_measure(&measurement);
+        if (measure_err != ESP_OK) {
+            ESP_LOGE(TAG, "USB bench measurement failed: %s", esp_err_to_name(measure_err));
+            continue;
+        }
+
+        soil_sample_t sample = {
+            .raw_mv = measurement.soil_mv,
+            .battery_mv = measurement.battery_mv,
+            .noise_mv = measurement.noise_mv,
+            .uptime_seconds = (uint32_t)(esp_timer_get_time() / 1000000ULL),
+            .manual_sample = true,
+        };
+        soil_model_step(policy, &sample, state);
+        board_led_status(state->moisture_pct, state->sensor_fault, true);
+        log_sample(state, &measurement);
+
+        if (!zigbee_ready) {
+            ESP_LOGI(TAG, "USB bench mode: waiting for Zigbee before manual report");
+            zigbee_ready = zigbee_transport_wait_ready(COMMISSIONING_WINDOW_MS);
+        }
+
+        esp_err_t publish_err = ESP_ERR_INVALID_STATE;
+        if (zigbee_ready) {
+            publish_err = publish_with_retry(state, &measurement);
+            vTaskDelay(pdMS_TO_TICKS(REPORT_SETTLE_MS));
+            board_pairing_indicator_off();
+        } else {
+            ESP_LOGW(TAG, "USB bench manual sample retained because Zigbee is not ready");
+        }
+
+        save_state(policy, state, true, publish_err);
+        vTaskDelay(pdMS_TO_TICKS(USB_BUTTON_DEBOUNCE_MS));
     }
 }
 
@@ -59,41 +154,26 @@ void app_main(void)
     };
     soil_model_step(&policy, &sample, &state);
     board_led_status(state.moisture_pct, state.sensor_fault, manual);
+    log_sample(&state, &measurement);
 
-    ESP_LOGI(TAG, "moisture=%.1f%% battery=%.1f%% raw=%.0fmV noise=%.1fmV mode=%s report=%s",
-             state.moisture_pct, state.battery_pct, measurement.soil_mv, measurement.noise_mv,
-             soil_mode_name(state.mode), state.should_report ? "yes" : "no");
+    bool zigbee_ready = false;
+    esp_err_t publish_err = ESP_OK;
 
-    if (state.should_report) {
+    if (state.should_report || usb_without_battery) {
         ESP_ERROR_CHECK(zigbee_transport_start());
         const uint32_t wait_ms = (manual || usb_without_battery) ? COMMISSIONING_WINDOW_MS : NORMAL_ZIGBEE_WAIT_MS;
         ESP_LOGI(TAG, "Zigbee commissioning/report window: %" PRIu32 " ms", wait_ms);
-        if (zigbee_transport_wait_ready(wait_ms)) {
+        zigbee_ready = zigbee_transport_wait_ready(wait_ms);
+
+        if (zigbee_ready) {
             const bool paired_now = board_pairing_indicator_is_success();
-            soil_diagnostics_t diag = {
-                .raw_mv = measurement.soil_mv,
-                .battery_mv = measurement.battery_mv,
-                .noise_mv = measurement.noise_mv,
-            };
-
-            esp_err_t publish_err = zigbee_transport_publish(&state, &diag);
-            if (publish_err != ESP_OK) {
-                ESP_LOGW(TAG, "Zigbee report delivery failed; retrying once in %u ms", REPORT_RETRY_DELAY_MS);
-                vTaskDelay(pdMS_TO_TICKS(REPORT_RETRY_DELAY_MS));
-                publish_err = zigbee_transport_publish(&state, &diag);
+            if (state.should_report) {
+                publish_err = publish_with_retry(&state, &measurement);
             }
-
-            if (publish_err == ESP_OK) {
-                ESP_LOGI(TAG, "Zigbee moisture report delivery confirmed");
-            } else {
-                ESP_LOGE(TAG, "Zigbee moisture report delivery failed after retry");
-                /* Force the next wake to attempt another report instead of treating this sample as delivered. */
-                state.seconds_since_report = policy.heartbeat_seconds;
-            }
-
             vTaskDelay(pdMS_TO_TICKS(paired_now ? PAIRING_RESULT_LED_MS : REPORT_SETTLE_MS));
             board_pairing_indicator_off();
         } else {
+            publish_err = ESP_ERR_TIMEOUT;
             const bool pairing_failed = board_pairing_indicator_is_searching();
             ESP_LOGW(TAG, "Zigbee unavailable after %" PRIu32 " ms; retaining state and backing off", wait_ms);
             if (pairing_failed) {
@@ -101,17 +181,16 @@ void app_main(void)
                 vTaskDelay(pdMS_TO_TICKS(PAIRING_RESULT_LED_MS));
                 board_pairing_indicator_off();
             }
-            if (state.sample_interval_seconds < 3600) state.sample_interval_seconds = 3600;
-            state.seconds_since_report = policy.heartbeat_seconds;
+            if (!usb_without_battery && state.sample_interval_seconds < 3600) {
+                state.sample_interval_seconds = 3600;
+            }
         }
     }
 
-    /* RTC memory retains every wake; flash checkpoints remain event-driven. */
-    storage_save_runtime(&state);
-    if (state.should_report || manual) (void)storage_save_checkpoint(&state);
+    save_state(&policy, &state, manual, publish_err);
 
     if (usb_without_battery) {
-        stay_awake_for_usb();
+        stay_awake_for_usb(&policy, &state, zigbee_ready);
     }
 
     enter_sleep(state.sample_interval_seconds ? state.sample_interval_seconds : policy.stable_sample_seconds);
