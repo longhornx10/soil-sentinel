@@ -45,6 +45,7 @@ static void test_watering_detection(void)
     soil_model_step(&p, &watered, &s);
     assert(s.mode == SOIL_MODE_WATERING_CAPTURE);
     assert((s.event_flags & SOIL_EVENT_WATERING) != 0);
+    assert((s.event_flags & SOIL_EVENT_MODE) != 0);
     assert(s.sample_interval_seconds == p.watering_sample_seconds);
     assert(s.has_watered);
     assert(s.seconds_since_watering == 0);
@@ -54,6 +55,9 @@ static void test_watering_detection(void)
     soil_model_step(&p, &settled, &s);
     assert(s.mode == SOIL_MODE_RECENTLY_WATERED);
     assert(s.seconds_since_watering == p.watering_sample_seconds);
+    assert((s.event_flags & SOIL_EVENT_MODE) != 0);
+    assert((s.event_flags & SOIL_EVENT_WATERING) == 0);
+    assert(s.should_report);
 }
 
 static void test_low_battery_survival(void)
