@@ -14,6 +14,20 @@ static uint32_t saturating_add_u32(uint32_t value, uint32_t increment)
     return UINT32_MAX - value < increment ? UINT32_MAX : value + increment;
 }
 
+static void apply_battery_mode(const soil_policy_t *policy, soil_state_t *state)
+{
+    (void)policy;
+    if (!state->battery_present) return;
+
+    if (state->battery_pct <= 8.0f) {
+        state->mode = SOIL_MODE_SURVIVAL;
+        state->sample_interval_seconds = 12u * 60u * 60u;
+    } else if (state->battery_pct <= 20.0f && state->mode == SOIL_MODE_STABLE) {
+        state->mode = SOIL_MODE_CONSERVATION;
+        state->sample_interval_seconds = 12u * 60u * 60u;
+    }
+}
+
 soil_policy_t soil_policy_default(void)
 {
     return (soil_policy_t){
@@ -139,6 +153,7 @@ void soil_model_step(const soil_policy_t *policy, const soil_sample_t *sample, s
         state->sample_interval_seconds = state->mode == SOIL_MODE_CRITICAL ? policy->critical_sample_seconds
                                        : state->mode == SOIL_MODE_NEAR_DRY ? policy->near_dry_sample_seconds
                                        : policy->stable_sample_seconds;
+        apply_battery_mode(policy, state);
         state->event_flags |= SOIL_EVENT_HEARTBEAT;
         if (sample->manual_sample) state->event_flags |= SOIL_EVENT_MANUAL;
         state->should_report = true;
@@ -185,13 +200,7 @@ void soil_model_step(const soil_policy_t *policy, const soil_sample_t *sample, s
         state->sample_interval_seconds = policy->stable_sample_seconds;
     }
 
-    if (sample->battery_present && state->battery_pct <= 8.0f) {
-        state->mode = SOIL_MODE_SURVIVAL;
-        state->sample_interval_seconds = 12u * 60u * 60u;
-    } else if (sample->battery_present && state->battery_pct <= 20.0f && state->mode == SOIL_MODE_STABLE) {
-        state->mode = SOIL_MODE_CONSERVATION;
-        state->sample_interval_seconds = 12u * 60u * 60u;
-    }
+    apply_battery_mode(policy, state);
 
     if (fabsf(moisture - state->last_reported_pct) >= policy->report_delta_pct) {
         state->event_flags |= SOIL_EVENT_THRESHOLD;
