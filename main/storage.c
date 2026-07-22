@@ -7,13 +7,13 @@
 
 #define NS "sentinel"
 #define RUNTIME_MAGIC 0x534F494Cu
-#define RUNTIME_VERSION 3u
+#define RUNTIME_VERSION 4u
 #define POLICY_MAGIC 0x504F4C59u
-#define POLICY_VERSION 3u
+#define POLICY_VERSION 4u
 #define STATE_MAGIC 0x53544154u
-#define STATE_VERSION 3u
-#define POLICY_KEY "policy_v3"
-#define STATE_KEY "state_v3"
+#define STATE_VERSION 4u
+#define POLICY_KEY "policy_v4"
+#define STATE_KEY "state_v4"
 
 typedef struct {
     uint32_t magic;
