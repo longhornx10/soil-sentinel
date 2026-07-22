@@ -31,11 +31,11 @@ The battery entities are reported only while an AA cell is present. USB bench mo
 - Raw probe voltage
 - Measurement noise
 - Valid moisture history, initially disabled
-- Time since watering, initially disabled and unavailable until watering has been observed
+- Time since watering, initially disabled; consult `Watering observed` to distinguish zero from no watering history
 - Report reason flags, initially disabled
 - Battery present, initially disabled
 
-All of these values travel in one telemetry report rather than one Zigbee packet per entity.
+All of these values travel in one telemetry report rather than one Zigbee packet per entity. Operating-mode transitions trigger a report so Home Assistant does not retain a stale mode or sample interval between moisture-delta reports.
 
 `Current measurement valid` distinguishes an electrically invalid sample from a noisy but finite sample. A noisy finite sample remains available, reports zero confidence, and raises `Sensor fault`; an electrically invalid sample publishes the native moisture value as unknown.
 
@@ -105,10 +105,11 @@ The 16-bit flags field uses:
 | 3 | Heartbeat |
 | 4 | Battery state changed |
 | 5 | Manual measurement |
+| 6 | Operating mode or adaptive sample interval changed |
 | 8 | Current sample electrically valid |
 | 9 | At least one valid moisture sample exists |
 | 10 | Watering has been observed since state initialization |
 
-Bits 6–7 and 11–15 are reserved. The quirk masks persistent status bits out of the user-facing report-reason entity.
+Bit 7 and bits 11–15 are reserved. The quirk masks persistent status bits out of the user-facing report-reason entity.
 
 The first byte visible to the C implementation is the ZCL octet-string length prefix and is not part of the 21-byte payload consumed by the Python quirk.
