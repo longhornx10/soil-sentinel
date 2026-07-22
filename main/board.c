@@ -36,7 +36,7 @@ static const char *TAG = "board";
 #define SOIL_SETTLE_MS                  1000U
 #define SOIL_READING_COUNT              10U
 #define SOIL_READING_INTERVAL_MS        200U
-#define PROBE_PWM_DUTY                  174U
+#define PROBE_PWM_DUTY                   87U
 #define LED_DRY_MAX_PCT                 20.0f
 #define LED_MOIST_MAX_PCT               60.0f
 #define BUTTON_POLL_MS                  20U
