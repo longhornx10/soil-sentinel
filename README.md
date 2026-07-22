@@ -1,22 +1,78 @@
 # Soil Sentinel
 
-Native ESP-IDF firmware for the Seeed Studio XIAO ESP32-C6 Soil Moisture Sensor, focused on calibrated readings, Zigbee, local event intelligence, and multi-year AA battery life.
+Native ESP-IDF firmware for the Seeed Studio XIAO ESP32-C6 Soil Moisture Sensor, focused on calibrated readings, Zigbee, local event intelligence, and long AA battery life.
 
-## Current foundation
+## Current capabilities
 
-- Native ESP-IDF 5.5.4 project, ESP32-C6 target
+- Native ESP-IDF 5.5.4 project for ESP32-C6
 - ESP Zigbee SDK 2.x sleepy end-device transport
+- External 2.4 GHz antenna selection matching the Seeed carrier
+- Factory-style 200 kHz probe excitation with a one-second analog settling period
+- Ten settled, filtered ADC readings per measurement
 - Calibrated 0–100% soil moisture score
-- Trimmed ADC burst sampling and noise estimation
 - Piecewise alkaline-AA battery estimate
-- Watering-event detection
+- Standard Zigbee moisture, battery percentage, and battery voltage attributes
+- Compact custom Zigbee telemetry for adaptive state and diagnostics
+- Included ZHA quirk for Home Assistant diagnostic entities
+- Watering-event detection and time-since-watering tracking
+- Drying-rate estimate and measurement-confidence score
 - Adaptive sampling modes
 - Critical-low-battery survival mode
-- Zigbee Analog Input moisture entity and Power Configuration battery entity
-- Deep-sleep wake cycle with button wake
-- Sparse NVS checkpoints to limit flash wear
+- Deep-sleep timer wake and physical-button wake
+- USB bench mode that remains awake and resamples from the large carrier button
+- Sparse, versioned NVS checkpoints to limit flash wear
 - Host tests for platform-independent logic
-- External 2.4 GHz antenna selection matching the Seeed soil-sensor assembly
+
+## Power policy
+
+The probe excitation, LEDs, and Zigbee radio are not left on between measurements.
+
+| State | Default sample interval |
+|---|---:|
+| Stable/moist | 4 hours |
+| Drying | 1 hour |
+| Near dry | 30 minutes |
+| Critical dry | 15 minutes |
+| Watering capture | 2 minutes |
+| Recently watered | 10 minutes |
+| Low-battery conservation | 12 hours |
+| Critical-battery survival | 12 hours |
+
+Reports are event-driven rather than sent after every sample. A heartbeat report is sent at least every 24 hours, while threshold changes, watering, faults, battery-state changes, and manual checks report immediately.
+
+## Local LED behavior
+
+A physical-button measurement shows:
+
+- Red below 20% moisture
+- Yellow from 20% through 59.9%
+- Green at 60% or above
+- Three quick red flashes for an electrically invalid reading
+
+Routine timed samples do not illuminate the LEDs. Factory-new Zigbee steering uses a repeating red blink, pairing success uses green, and commissioning failure uses yellow.
+
+## Home Assistant entities
+
+Native ZHA discovery provides:
+
+- Soil moisture
+- Battery percentage
+- Battery voltage
+
+The included quirk additionally provides:
+
+- Operating mode
+- Sensor fault
+- Measurement confidence
+- Drying rate
+- Sample interval
+- Raw probe voltage
+- Measurement noise
+- Time since watering
+- Report reason flags
+- Battery present
+
+See [`docs/ZHA.md`](docs/ZHA.md) for installation and re-pairing instructions.
 
 ## Hardware safety before first power
 
@@ -29,51 +85,42 @@ Native ESP-IDF firmware for the Seeed Studio XIAO ESP32-C6 Soil Moisture Sensor,
 
 Firmware cannot protect against a direct mechanical short between a battery terminal and damaged antenna wiring.
 
-## Build
+## Build and host tests
 
 ```bash
 git clone https://github.com/longhornx10/soil-sentinel.git
 cd soil-sentinel
 
-# ESP-IDF 5.5.4 environment
 source ~/esp/esp-idf/export.sh
 ./scripts/test-host.sh
 ./scripts/build.sh
 idf.py -p /dev/ttyACM0 flash monitor
 ```
 
-Erase the factory firmware/NVRAM before the first Zigbee join:
+Erase the factory firmware and Zigbee NVRAM only before the first join:
 
 ```bash
 idf.py -p /dev/ttyACM0 erase-flash flash monitor
 ```
 
-## Pin map
+Do not erase an already paired sensor during routine firmware updates.
 
-| Function | GPIO |
-|---|---:|
-| Battery ADC | 0 |
-| Soil ADC | 1 |
-| Button / wake | 2 |
-| RF switch control enable, active low | 3 |
-| External antenna select, high | 14 |
-| Probe excitation, 200 kHz | 21 |
-| Yellow LED | 18 |
-| Green LED | 19 |
-| Red LED | 20 |
+## Audited pin map
 
-## Development order
+| Function | GPIO | Firmware behavior |
+|---|---:|---|
+| Battery ADC | 0 | ADC1 input |
+| Soil ADC | 1 | ADC1 input |
+| Button / deep-sleep wake | 2 | Active low with pull-up |
+| RF switch control enable | 3 | Driven low |
+| External antenna select | 14 | Driven high after RF enable |
+| Yellow LED | 18 | Active high |
+| Green LED | 19 | Active high |
+| Red LED | 20 | Active high |
+| Probe excitation | 21 | 200 kHz, 174/255 duty only while measuring |
 
-1. Compile and flash one sacrificially brave sensor.
-2. Characterize dry/wet ADC values and probe stabilization time.
-3. Measure deep-sleep, local-sample, Zigbee-report, retry, and rejoin energy.
-4. Correct any board-specific ADC scaling and Zigbee interview behavior.
-5. Add button calibration and Zigbee diagnostics/custom attributes.
-6. Prototype LP-core ADC/PWM supervision and retain it only if it wins the power measurements.
-7. Add ZHA and Zigbee2MQTT integration definitions where standard discovery is insufficient.
+GPIO12 and GPIO13 remain reserved for native USB D- and D+. GPIO9 remains a boot strap and is not used by the application.
 
-## Status
+## Validation status
 
-This is an initial engineering build. The host-side state engine is tested. Hardware and Zigbee compilation/behavior still require validation against a physical sensor and the pinned Espressif SDK, because embedded development enjoys charging admission at the hardware boundary.
-
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+The platform-independent state engine is host-tested. Every firmware change still requires an ESP-IDF build and one physical-board test because the Zigbee stack, carrier analog front end, and actual battery consumption cannot be validated honestly by desktop unit tests alone. Embedded hardware remains committed to making confidence expensive.
