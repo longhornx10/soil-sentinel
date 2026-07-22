@@ -12,7 +12,7 @@ typedef struct {
 esp_err_t board_init(void);
 esp_err_t board_measure(board_measurement_t *out);
 bool board_button_pressed(void);
-void board_led_status(float moisture_pct, bool sample_valid, bool manual);
+void board_led_status(float moisture_pct, bool diagnostic_fault, bool manual);
 
 esp_err_t board_pairing_indicator_start(void);
 bool board_pairing_indicator_is_searching(void);
