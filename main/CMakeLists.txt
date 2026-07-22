@@ -2,13 +2,17 @@ idf_component_register(
     SRCS
         "app_main.c"
         "board.c"
+        "firmware_update.c"
+        "ota_file_parser.c"
         "storage.c"
         "zigbee_transport.c"
         "../core/src/soil_model.c"
+        "../core/src/soil_service.c"
     INCLUDE_DIRS
         "."
         "../core/include"
     REQUIRES
+        app_update
         esp_adc
         driver
         nvs_flash
