@@ -41,6 +41,7 @@ class SoilSentinelEventFlags(t.bitmap16):
     Heartbeat = 1 << 3
     Battery = 1 << 4
     Manual = 1 << 5
+    Mode = 1 << 6
 
 
 class SoilSentinelTelemetryCluster(CustomCluster):
@@ -51,7 +52,7 @@ class SoilSentinelTelemetryCluster(CustomCluster):
 
     TELEMETRY_SCHEMA_VERSION = 1
     TELEMETRY_PAYLOAD_LENGTH = 21
-    REPORT_REASON_MASK = 0x003F
+    REPORT_REASON_MASK = 0x007F
     STATUS_CURRENT_SAMPLE_VALID = 1 << 8
     STATUS_HAS_VALID_MOISTURE = 1 << 9
     STATUS_HAS_WATERED = 1 << 10
@@ -119,11 +120,10 @@ class SoilSentinelTelemetryCluster(CustomCluster):
             self.AttributeDefs.sample_interval.id,
             int.from_bytes(payload[12:16], "little"),
         )
-        if has_watered:
-            self._update_attribute(
-                self.AttributeDefs.seconds_since_watering.id,
-                int.from_bytes(payload[16:20], "little"),
-            )
+        self._update_attribute(
+            self.AttributeDefs.seconds_since_watering.id,
+            int.from_bytes(payload[16:20], "little"),
+        )
         self._update_attribute(self.AttributeDefs.battery_present.id, bool(payload[20]))
         self._update_attribute(
             self.AttributeDefs.current_sample_valid.id, current_sample_valid
