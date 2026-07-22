@@ -50,12 +50,15 @@ typedef struct {
     float raw_mv;
     float battery_mv;
     float noise_mv;
-    uint32_t uptime_seconds;
+    uint32_t elapsed_seconds;
     bool manual_sample;
+    bool battery_present;
 } soil_sample_t;
 
 typedef struct {
     bool initialized;
+    bool has_valid_moisture;
+    bool battery_present;
     float moisture_pct;
     float previous_moisture_pct;
     float last_reported_pct;
