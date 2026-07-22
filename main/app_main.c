@@ -16,6 +16,7 @@
 #define REPORT_SETTLE_MS 250U
 #define PAIRING_RESULT_LED_MS 1200U
 #define USB_NO_BATTERY_THRESHOLD_MV 500.0f
+#define USB_IDLE_DELAY_MS 60000U
 
 static const char *TAG = "soil-sentinel";
 
@@ -25,6 +26,14 @@ static void enter_sleep(uint32_t seconds)
     esp_sleep_enable_ext1_wakeup(1ULL << GPIO_NUM_2, ESP_EXT1_WAKEUP_ANY_LOW);
     ESP_LOGI(TAG, "sleeping for %" PRIu32 " seconds", seconds);
     esp_deep_sleep_start();
+}
+
+static void stay_awake_for_usb(void)
+{
+    ESP_LOGI(TAG, "USB bench mode: no battery detected; staying awake for monitor and flashing");
+    while (true) {
+        vTaskDelay(pdMS_TO_TICKS(USB_IDLE_DELAY_MS));
+    }
 }
 
 void app_main(void)
@@ -39,6 +48,7 @@ void app_main(void)
     board_measurement_t measurement;
     ESP_ERROR_CHECK(board_measure(&measurement));
     const bool manual = board_button_pressed() || esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT1;
+    /* The supported service workflow removes the AA before USB power is attached. */
     const bool usb_without_battery = measurement.battery_mv < USB_NO_BATTERY_THRESHOLD_MV;
     soil_sample_t sample = {
         .raw_mv = measurement.soil_mv,
@@ -99,5 +109,10 @@ void app_main(void)
     /* RTC memory retains every wake; flash checkpoints remain event-driven. */
     storage_save_runtime(&state);
     if (state.should_report || manual) (void)storage_save_checkpoint(&state);
+
+    if (usb_without_battery) {
+        stay_awake_for_usb();
+    }
+
     enter_sleep(state.sample_interval_seconds ? state.sample_interval_seconds : policy.stable_sample_seconds);
 }
