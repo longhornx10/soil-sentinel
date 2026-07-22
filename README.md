@@ -123,7 +123,7 @@ See:
 | Yellow LED | 18 | Active high; held low during sleep |
 | Green LED | 19 | Active high; held low during sleep |
 | Red LED | 20 | Active high; held low during sleep |
-| Probe excitation | 21 | 200 kHz, 174/255 duty only while measuring; held low during sleep |
+| Probe excitation | 21 | 200 kHz, 87/255 duty only while measuring; held low during sleep |
 
 GPIO12 and GPIO13 remain reserved for native USB D- and D+. GPIO9 remains a boot strap and is not used.
 
