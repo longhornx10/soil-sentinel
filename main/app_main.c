@@ -189,6 +189,7 @@ void app_main(void)
     const bool manual = button_wake || board_button_pressed();
     /* The supported service workflow removes the AA before USB power is attached. */
     const bool usb_without_battery = measurement.battery_mv < USB_NO_BATTERY_THRESHOLD_MV;
+    esp_log_level_set("*", usb_without_battery ? ESP_LOG_INFO : ESP_LOG_WARN);
 
     soil_sample_t sample = {
         .raw_mv = measurement.soil_mv,
