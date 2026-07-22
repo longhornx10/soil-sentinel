@@ -60,6 +60,7 @@ typedef struct {
     bool has_valid_moisture;
     bool current_sample_valid;
     bool battery_present;
+    bool has_watered;
     float moisture_pct;
     float previous_moisture_pct;
     float last_reported_pct;
