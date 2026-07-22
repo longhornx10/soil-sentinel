@@ -9,7 +9,7 @@
 #include "freertos/task.h"
 #include "esp_log.h"
 #include "esp_sleep.h"
-#include "esp_timer.h"
+#include "esp_private/esp_clk.h"
 
 #define NORMAL_ZIGBEE_WAIT_MS 20000U
 #define COMMISSIONING_WINDOW_MS 120000U
@@ -23,6 +23,13 @@
                                SOIL_EVENT_HEARTBEAT | SOIL_EVENT_BATTERY)
 
 static const char *TAG = "soil-sentinel";
+
+static uint32_t elapsed_seconds_between(uint64_t now_us, uint64_t before_us)
+{
+    if (before_us == 0U || now_us <= before_us) return 0U;
+    const uint64_t elapsed = (now_us - before_us) / 1000000ULL;
+    return elapsed > UINT32_MAX ? UINT32_MAX : (uint32_t)elapsed;
+}
 
 static void enter_sleep(uint32_t seconds)
 {
@@ -93,7 +100,6 @@ static void stay_awake_for_usb(const soil_policy_t *policy, soil_state_t *state,
 {
     ESP_LOGI(TAG, "USB bench mode: no battery detected; staying awake for monitor and flashing");
     ESP_LOGI(TAG, "USB bench mode: press the large sensor button for a fresh sample and Zigbee report");
-    int64_t previous_sample_us = esp_timer_get_time();
 
     while (true) {
         if (!board_button_pressed()) {
@@ -113,18 +119,15 @@ static void stay_awake_for_usb(const soil_policy_t *policy, soil_state_t *state,
 
         ESP_LOGI(TAG, "USB bench button pressed; taking a fresh manual sample");
 
+        const uint64_t sample_rtc_us = esp_clk_rtc_time();
+        const uint32_t elapsed_seconds = elapsed_seconds_between(sample_rtc_us, state->last_sample_rtc_us);
+
         board_measurement_t measurement;
         const esp_err_t measure_err = board_measure(&measurement);
         if (measure_err != ESP_OK) {
             ESP_LOGE(TAG, "USB bench measurement failed: %s", esp_err_to_name(measure_err));
             continue;
         }
-
-        const int64_t now_us = esp_timer_get_time();
-        const uint32_t elapsed_seconds = now_us > previous_sample_us
-                                                 ? (uint32_t)((now_us - previous_sample_us) / 1000000ULL)
-                                                 : 0U;
-        previous_sample_us = now_us;
 
         soil_sample_t sample = {
             .raw_mv = measurement.soil_mv,
@@ -135,6 +138,7 @@ static void stay_awake_for_usb(const soil_policy_t *policy, soil_state_t *state,
             .battery_present = false,
         };
         soil_model_step(policy, &sample, state);
+        state->last_sample_rtc_us = sample_rtc_us;
         board_led_status(state->current_sample_valid ? state->moisture_pct : NAN,
                          state->sensor_fault, true);
         log_sample(state, &measurement);
@@ -168,9 +172,17 @@ void app_main(void)
     ESP_ERROR_CHECK(storage_load(&policy, &state));
 
     const esp_sleep_wakeup_cause_t wake_cause = esp_sleep_get_wakeup_cause();
-    const bool timer_wake = wake_cause == ESP_SLEEP_WAKEUP_TIMER;
+    const bool deep_sleep_wake = wake_cause == ESP_SLEEP_WAKEUP_TIMER ||
+                                 wake_cause == ESP_SLEEP_WAKEUP_EXT1;
     const bool button_wake = wake_cause == ESP_SLEEP_WAKEUP_EXT1;
-    const uint32_t elapsed_seconds = timer_wake ? state.sample_interval_seconds : 0U;
+    const uint64_t sample_rtc_us = esp_clk_rtc_time();
+    uint32_t elapsed_seconds = deep_sleep_wake
+                                   ? elapsed_seconds_between(sample_rtc_us, state.last_sample_rtc_us)
+                                   : 0U;
+    if (wake_cause == ESP_SLEEP_WAKEUP_TIMER && elapsed_seconds == 0U) {
+        /* Safe fallback for the first wake after a retained-state schema change. */
+        elapsed_seconds = state.sample_interval_seconds;
+    }
 
     board_measurement_t measurement;
     ESP_ERROR_CHECK(board_measure(&measurement));
@@ -187,6 +199,7 @@ void app_main(void)
         .battery_present = !usb_without_battery,
     };
     soil_model_step(&policy, &sample, &state);
+    state.last_sample_rtc_us = sample_rtc_us;
     board_led_status(state.current_sample_valid ? state.moisture_pct : NAN,
                      state.sensor_fault, manual);
     log_sample(&state, &measurement);
