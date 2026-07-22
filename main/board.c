@@ -31,11 +31,13 @@ static const char *TAG = "board";
 #define MANUAL_FAULT_BLINK_GAP_US      100000U
 #define MANUAL_FAULT_BLINK_COUNT       3U
 #define PAIRING_BLINK_INTERVAL_MS      300U
-#define SAMPLE_COUNT                   24
+#define SAMPLE_COUNT                   24U
 #define SOIL_SETTLE_MS                 1000U
 #define SOIL_READING_COUNT             10U
 #define SOIL_READING_INTERVAL_MS       200U
-#define PROBE_PWM_DUTY                  174U
+#define PROBE_PWM_DUTY                 174U
+#define LED_DRY_MAX_PCT                20.0f
+#define LED_MOIST_MAX_PCT              60.0f
 
 typedef enum {
     PAIRING_LED_OFF = 0,
@@ -55,6 +57,13 @@ static void set_leds(bool red, bool yellow, bool green)
     gpio_set_level(PIN_LED_RED, red ? 1 : 0);
     gpio_set_level(PIN_LED_YELLOW, yellow ? 1 : 0);
     gpio_set_level(PIN_LED_GREEN, green ? 1 : 0);
+}
+
+static esp_err_t set_probe_duty(uint32_t duty)
+{
+    ESP_RETURN_ON_ERROR(ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, duty), TAG,
+                        "failed to set probe PWM duty");
+    return ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
 }
 
 static void pairing_blink_task(void *arg)
@@ -78,41 +87,66 @@ static int compare_int(const void *a, const void *b)
     return (*(const int *)a > *(const int *)b) - (*(const int *)a < *(const int *)b);
 }
 
-static float read_channel_mv(adc_channel_t channel, adc_cali_handle_t cali, float *noise_mv)
+static esp_err_t read_channel_mv(adc_channel_t channel,
+                                 adc_cali_handle_t cali,
+                                 float *value_mv,
+                                 float *noise_mv)
 {
+    ESP_RETURN_ON_FALSE(value_mv, ESP_ERR_INVALID_ARG, TAG, "ADC output pointer is null");
+
     int values[SAMPLE_COUNT];
     for (size_t i = 0; i < SAMPLE_COUNT; ++i) {
-        adc_oneshot_read(s_adc, channel, &values[i]);
+        ESP_RETURN_ON_ERROR(adc_oneshot_read(s_adc, channel, &values[i]), TAG,
+                            "ADC oneshot read failed");
         esp_rom_delay_us(300);
     }
+
     qsort(values, SAMPLE_COUNT, sizeof(values[0]), compare_int);
     long sum = 0;
-    for (size_t i = 3; i < SAMPLE_COUNT - 3; ++i) sum += values[i];
+    for (size_t i = 3; i < SAMPLE_COUNT - 3; ++i) {
+        sum += values[i];
+    }
     const int raw = (int)(sum / (SAMPLE_COUNT - 6));
+
     int mv = 0;
     if (cali && adc_cali_raw_to_voltage(cali, raw, &mv) == ESP_OK) {
+        *value_mv = (float)mv;
         if (noise_mv) {
-            int lo = 0, hi = 0;
-            adc_cali_raw_to_voltage(cali, values[3], &lo);
-            adc_cali_raw_to_voltage(cali, values[SAMPLE_COUNT - 4], &hi);
-            *noise_mv = (float)(hi - lo);
+            int lo = 0;
+            int hi = 0;
+            if (adc_cali_raw_to_voltage(cali, values[3], &lo) == ESP_OK &&
+                adc_cali_raw_to_voltage(cali, values[SAMPLE_COUNT - 4], &hi) == ESP_OK) {
+                *noise_mv = (float)(hi - lo);
+            } else {
+                *noise_mv = 0.0f;
+            }
         }
-        return (float)mv;
+        return ESP_OK;
     }
-    if (noise_mv) *noise_mv = (float)(values[SAMPLE_COUNT - 4] - values[3]);
-    return raw * 3300.0f / 4095.0f;
+
+    *value_mv = raw * 3300.0f / 4095.0f;
+    if (noise_mv) {
+        *noise_mv = (values[SAMPLE_COUNT - 4] - values[3]) * 3300.0f / 4095.0f;
+    }
+    return ESP_OK;
 }
 
-static float read_settled_soil_mv(float *noise_mv)
+static esp_err_t read_settled_soil_mv(float *value_mv, float *noise_mv)
 {
+    ESP_RETURN_ON_FALSE(value_mv && noise_mv, ESP_ERR_INVALID_ARG, TAG,
+                        "soil measurement output pointer is null");
+
     float sum_mv = 0.0f;
     float min_mv = INFINITY;
     float max_mv = -INFINITY;
     float burst_noise_sum_mv = 0.0f;
 
     for (size_t i = 0; i < SOIL_READING_COUNT; ++i) {
+        float sample_mv = 0.0f;
         float burst_noise_mv = 0.0f;
-        const float sample_mv = read_channel_mv(ADC_CHANNEL_1, s_soil_cali, &burst_noise_mv);
+        ESP_RETURN_ON_ERROR(read_channel_mv(ADC_CHANNEL_1, s_soil_cali,
+                                            &sample_mv, &burst_noise_mv), TAG,
+                            "soil ADC read failed");
         sum_mv += sample_mv;
         burst_noise_sum_mv += burst_noise_mv;
         if (sample_mv < min_mv) min_mv = sample_mv;
@@ -123,13 +157,11 @@ static float read_settled_soil_mv(float *noise_mv)
         }
     }
 
-    if (noise_mv) {
-        const float between_reading_range_mv = max_mv - min_mv;
-        const float average_burst_noise_mv = burst_noise_sum_mv / (float)SOIL_READING_COUNT;
-        *noise_mv = fmaxf(between_reading_range_mv, average_burst_noise_mv);
-    }
-
-    return sum_mv / (float)SOIL_READING_COUNT;
+    const float between_reading_range_mv = max_mv - min_mv;
+    const float average_burst_noise_mv = burst_noise_sum_mv / (float)SOIL_READING_COUNT;
+    *noise_mv = fmaxf(between_reading_range_mv, average_burst_noise_mv);
+    *value_mv = sum_mv / (float)SOIL_READING_COUNT;
+    return ESP_OK;
 }
 
 esp_err_t board_init(void)
@@ -194,9 +226,14 @@ esp_err_t board_init(void)
 
     adc_oneshot_unit_init_cfg_t unit_cfg = {.unit_id = ADC_UNIT_1};
     ESP_RETURN_ON_ERROR(adc_oneshot_new_unit(&unit_cfg, &s_adc), TAG, "ADC init failed");
-    adc_oneshot_chan_cfg_t chan_cfg = {.atten = ADC_ATTEN_DB_12, .bitwidth = ADC_BITWIDTH_DEFAULT};
-    ESP_RETURN_ON_ERROR(adc_oneshot_config_channel(s_adc, ADC_CHANNEL_0, &chan_cfg), TAG, "battery ADC config failed");
-    ESP_RETURN_ON_ERROR(adc_oneshot_config_channel(s_adc, ADC_CHANNEL_1, &chan_cfg), TAG, "soil ADC config failed");
+    adc_oneshot_chan_cfg_t chan_cfg = {
+        .atten = ADC_ATTEN_DB_12,
+        .bitwidth = ADC_BITWIDTH_DEFAULT,
+    };
+    ESP_RETURN_ON_ERROR(adc_oneshot_config_channel(s_adc, ADC_CHANNEL_0, &chan_cfg), TAG,
+                        "battery ADC config failed");
+    ESP_RETURN_ON_ERROR(adc_oneshot_config_channel(s_adc, ADC_CHANNEL_1, &chan_cfg), TAG,
+                        "soil ADC config failed");
 
     adc_cali_curve_fitting_config_t soil_cali_cfg = {
         .unit_id = ADC_UNIT_1,
@@ -215,19 +252,27 @@ esp_err_t board_measure(board_measurement_t *out)
 {
     ESP_RETURN_ON_FALSE(out, ESP_ERR_INVALID_ARG, TAG, "measurement output is null");
 
-    ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, PROBE_PWM_DUTY);
-    ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
+    ESP_RETURN_ON_ERROR(set_probe_duty(PROBE_PWM_DUTY), TAG, "failed to start probe excitation");
 
     /* The capacitive front end needs time to charge and stabilize before the ADC is useful. */
     vTaskDelay(pdMS_TO_TICKS(SOIL_SETTLE_MS));
-    out->soil_mv = read_settled_soil_mv(&out->noise_mv);
+    const esp_err_t soil_err = read_settled_soil_mv(&out->soil_mv, &out->noise_mv);
 
-    ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, 0);
-    ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
+    const esp_err_t stop_err = set_probe_duty(0);
     vTaskDelay(pdMS_TO_TICKS(1));
+    if (soil_err != ESP_OK) return soil_err;
+    if (stop_err != ESP_OK) return stop_err;
 
-    out->battery_mv = read_channel_mv(ADC_CHANNEL_0, s_battery_cali, NULL);
+    ESP_RETURN_ON_ERROR(read_channel_mv(ADC_CHANNEL_0, s_battery_cali,
+                                        &out->battery_mv, NULL), TAG,
+                        "battery ADC read failed");
     return ESP_OK;
+}
+
+void board_prepare_sleep(void)
+{
+    (void)set_probe_duty(0);
+    set_leds(false, false, false);
 }
 
 bool board_button_pressed(void)
@@ -235,7 +280,7 @@ bool board_button_pressed(void)
     return gpio_get_level(PIN_BUTTON) == 0;
 }
 
-void board_led_status(float moisture_pct, bool fault, bool manual)
+void board_led_status(float moisture_pct, bool diagnostic_fault, bool manual)
 {
     set_leds(false, false, false);
     if (!manual) return;
@@ -252,15 +297,14 @@ void board_led_status(float moisture_pct, bool fault, bool manual)
         return;
     }
 
-    /* A finite manual reading always shows its moisture band. Diagnostic faults stay in telemetry. */
-    const gpio_num_t pin = moisture_pct < 20.0f ? PIN_LED_RED
-                           : moisture_pct < 30.0f ? PIN_LED_YELLOW
-                                                  : PIN_LED_GREEN;
+    const gpio_num_t pin = moisture_pct < LED_DRY_MAX_PCT ? PIN_LED_RED
+                           : moisture_pct < LED_MOIST_MAX_PCT ? PIN_LED_YELLOW
+                                                              : PIN_LED_GREEN;
     gpio_set_level(pin, 1);
     esp_rom_delay_us(MANUAL_LED_PULSE_US);
     gpio_set_level(pin, 0);
 
-    if (fault) {
+    if (diagnostic_fault) {
         ESP_LOGW(TAG, "manual LED showed moisture band while diagnostics flagged the sample");
     }
 }
@@ -275,7 +319,8 @@ esp_err_t board_pairing_indicator_start(void)
         return ESP_OK;
     }
 
-    if (xTaskCreate(pairing_blink_task, "pair_led", 2048, NULL, 3, &s_pairing_blink_task) != pdPASS) {
+    if (xTaskCreate(pairing_blink_task, "pair_led", 2048, NULL, 3,
+                    &s_pairing_blink_task) != pdPASS) {
         s_pairing_led_state = PAIRING_LED_OFF;
         s_pairing_blink_task = NULL;
         return ESP_ERR_NO_MEM;
