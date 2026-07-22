@@ -264,6 +264,7 @@ static void stay_awake_for_usb(soil_policy_t *policy,
             .battery_present = false,
         };
         soil_model_step(policy, &sample, state);
+        log_sample(policy, state, &measurement);
         state->last_sample_rtc_us = now_us;
         board_led_status(state->current_sample_valid ? state->moisture_pct : NAN,
                          state->sensor_fault, true);
