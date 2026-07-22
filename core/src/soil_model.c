@@ -134,6 +134,9 @@ void soil_model_step(const soil_policy_t *policy, const soil_sample_t *sample, s
         if (sample->manual_sample) {
             state->event_flags |= SOIL_EVENT_MANUAL;
         }
+        if (was_initialized && state->mode != previous_mode) {
+            state->event_flags |= SOIL_EVENT_MODE;
+        }
         state->should_report = state->event_flags != SOIL_EVENT_NONE;
         if (state->should_report) state->seconds_since_report = 0;
         return;
@@ -202,6 +205,9 @@ void soil_model_step(const soil_policy_t *policy, const soil_sample_t *sample, s
 
     apply_battery_mode(policy, state);
 
+    if (state->mode != previous_mode) {
+        state->event_flags |= SOIL_EVENT_MODE;
+    }
     if (fabsf(moisture - state->last_reported_pct) >= policy->report_delta_pct) {
         state->event_flags |= SOIL_EVENT_THRESHOLD;
     }
