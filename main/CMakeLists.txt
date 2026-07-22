@@ -21,3 +21,7 @@ idf_component_register(
         esp_hw_support
         espressif__esp-zigbee-lib
 )
+
+target_compile_options(${COMPONENT_LIB} PRIVATE
+    "SHELL:-include ${CMAKE_CURRENT_LIST_DIR}/soil_sdk_compat.h"
+)
