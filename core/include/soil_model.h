@@ -71,6 +71,7 @@ typedef struct {
     uint32_t seconds_since_watering;
     uint32_t sample_interval_seconds;
     uint32_t event_flags;
+    uint64_t last_sample_rtc_us;
     soil_mode_t mode;
     bool sensor_fault;
     bool should_report;
