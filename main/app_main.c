@@ -1,4 +1,5 @@
 #include <inttypes.h>
+#include <math.h>
 #include "board.h"
 #include "storage.h"
 #include "zigbee_transport.h"
@@ -36,11 +37,12 @@ static void log_sample(const soil_state_t *state, const board_measurement_t *mea
 {
     ESP_LOGI(TAG,
              "moisture=%.1f%% battery=%s%.1f%% raw=%.0fmV noise=%.1fmV confidence=%.0f%% "
-             "mode=%s interval=%" PRIu32 "s events=0x%02" PRIx32 " fault=%s report=%s",
+             "mode=%s interval=%" PRIu32 "s events=0x%02" PRIx32 " fault=%s valid=%s report=%s",
              state->moisture_pct, state->battery_present ? "" : "n/a ", state->battery_pct,
              measurement->soil_mv, measurement->noise_mv, state->confidence_pct,
              soil_mode_name(state->mode), state->sample_interval_seconds, state->event_flags,
-             state->sensor_fault ? "yes" : "no", state->should_report ? "yes" : "no");
+             state->sensor_fault ? "yes" : "no", state->current_sample_valid ? "yes" : "no",
+             state->should_report ? "yes" : "no");
 }
 
 static esp_err_t publish_with_retry(const soil_state_t *state, const board_measurement_t *measurement)
@@ -127,7 +129,8 @@ static void stay_awake_for_usb(const soil_policy_t *policy, soil_state_t *state,
             .battery_present = false,
         };
         soil_model_step(policy, &sample, state);
-        board_led_status(state->moisture_pct, state->sensor_fault, true);
+        board_led_status(state->current_sample_valid ? state->moisture_pct : NAN,
+                         state->sensor_fault, true);
         log_sample(state, &measurement);
 
         if (!zigbee_ready) {
@@ -178,7 +181,8 @@ void app_main(void)
         .battery_present = !usb_without_battery,
     };
     soil_model_step(&policy, &sample, &state);
-    board_led_status(state.moisture_pct, state.sensor_fault, manual);
+    board_led_status(state.current_sample_valid ? state.moisture_pct : NAN,
+                     state.sensor_fault, manual);
     log_sample(&state, &measurement);
 
     bool zigbee_ready = false;
