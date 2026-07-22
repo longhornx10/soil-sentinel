@@ -12,7 +12,8 @@
 
 #define NORMAL_ZIGBEE_WAIT_MS 20000U
 #define COMMISSIONING_WINDOW_MS 120000U
-#define REPORT_SETTLE_MS 750U
+#define REPORT_RETRY_DELAY_MS 500U
+#define REPORT_SETTLE_MS 250U
 #define PAIRING_RESULT_LED_MS 1200U
 #define USB_NO_BATTERY_THRESHOLD_MV 500.0f
 
@@ -64,7 +65,22 @@ void app_main(void)
                 .battery_mv = measurement.battery_mv,
                 .noise_mv = measurement.noise_mv,
             };
-            (void)zigbee_transport_publish(&state, &diag);
+
+            esp_err_t publish_err = zigbee_transport_publish(&state, &diag);
+            if (publish_err != ESP_OK) {
+                ESP_LOGW(TAG, "Zigbee report delivery failed; retrying once in %u ms", REPORT_RETRY_DELAY_MS);
+                vTaskDelay(pdMS_TO_TICKS(REPORT_RETRY_DELAY_MS));
+                publish_err = zigbee_transport_publish(&state, &diag);
+            }
+
+            if (publish_err == ESP_OK) {
+                ESP_LOGI(TAG, "Zigbee moisture report delivery confirmed");
+            } else {
+                ESP_LOGE(TAG, "Zigbee moisture report delivery failed after retry");
+                /* Force the next wake to attempt another report instead of treating this sample as delivered. */
+                state.seconds_since_report = policy.heartbeat_seconds;
+            }
+
             vTaskDelay(pdMS_TO_TICKS(paired_now ? PAIRING_RESULT_LED_MS : REPORT_SETTLE_MS));
             board_pairing_indicator_off();
         } else {
@@ -76,6 +92,7 @@ void app_main(void)
                 board_pairing_indicator_off();
             }
             if (state.sample_interval_seconds < 3600) state.sample_interval_seconds = 3600;
+            state.seconds_since_report = policy.heartbeat_seconds;
         }
     }
 
