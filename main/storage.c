@@ -7,7 +7,7 @@
 
 #define NS "sentinel"
 #define RUNTIME_MAGIC 0x534F494Cu
-#define RUNTIME_VERSION 1u
+#define RUNTIME_VERSION 2u
 
 typedef struct {
     uint32_t magic;
