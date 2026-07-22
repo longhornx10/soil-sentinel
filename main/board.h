@@ -11,6 +11,7 @@ typedef struct {
 
 esp_err_t board_init(void);
 esp_err_t board_measure(board_measurement_t *out);
+void board_prepare_sleep(void);
 bool board_button_pressed(void);
 void board_led_status(float moisture_pct, bool diagnostic_fault, bool manual);
 
