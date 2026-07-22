@@ -58,6 +58,7 @@ typedef struct {
 typedef struct {
     bool initialized;
     bool has_valid_moisture;
+    bool current_sample_valid;
     bool battery_present;
     float moisture_pct;
     float previous_moisture_pct;
