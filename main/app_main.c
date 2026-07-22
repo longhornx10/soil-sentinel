@@ -23,6 +23,7 @@
 #define USB_NO_BATTERY_THRESHOLD_MV 500.0f
 #define USB_BUTTON_POLL_MS 20U
 #define USB_BUTTON_DEBOUNCE_MS 30U
+#define USB_BATTERY_RECHECK_MS 1000U
 #define CONFIG_DELIVERY_WINDOW_MS 5000U
 #define OTA_SERVICE_WINDOW_MS (15U * 60U * 1000U)
 #define OTA_WAIT_INDICATOR_MS 30000U
@@ -230,9 +231,20 @@ static void stay_awake_for_usb(soil_policy_t *policy,
                                bool zigbee_ready)
 {
     ESP_LOGI(TAG, "USB bench mode: no battery detected; staying awake");
+    uint32_t battery_recheck_ms = 0U;
     while (true) {
         if (!board_button_pressed()) {
             vTaskDelay(pdMS_TO_TICKS(USB_BUTTON_POLL_MS));
+            battery_recheck_ms += USB_BUTTON_POLL_MS;
+            if (battery_recheck_ms >= USB_BATTERY_RECHECK_MS) {
+                float battery_mv = 0.0f;
+                battery_recheck_ms = 0U;
+                if (board_read_battery_mv(&battery_mv) == ESP_OK &&
+                    battery_mv >= USB_NO_BATTERY_THRESHOLD_MV) {
+                    ESP_LOGI(TAG, "AA battery detected in USB bench mode; restarting into battery mode");
+                    esp_restart();
+                }
+            }
             if (zigbee_ready && zigbee_transport_wait_config_change(0U)) {
                 board_measurement_t current;
                 if (board_measure(&current) == ESP_OK) {
@@ -245,6 +257,7 @@ static void stay_awake_for_usb(soil_policy_t *policy,
             continue;
         }
 
+        battery_recheck_ms = 0U;
         const button_action_t action = classify_button_hold(0.0f, false);
         if (action == BUTTON_ACTION_FACTORY_RESET) {
             (void)storage_factory_reset(true);
@@ -285,6 +298,7 @@ void app_main(void)
     const bool deep_sleep_wake = wake_cause == ESP_SLEEP_WAKEUP_TIMER ||
                                  wake_cause == ESP_SLEEP_WAKEUP_EXT1;
     const bool button_wake = wake_cause == ESP_SLEEP_WAKEUP_EXT1;
+    const bool cold_boot = !deep_sleep_wake;
     if (deep_sleep_wake) esp_log_level_set("*", ESP_LOG_WARN);
 
     ESP_ERROR_CHECK(storage_init());
@@ -298,8 +312,12 @@ void app_main(void)
     float early_battery_mv = 0.0f;
     ESP_ERROR_CHECK(board_read_battery_mv(&early_battery_mv));
     const bool early_battery_present = early_battery_mv >= USB_NO_BATTERY_THRESHOLD_MV;
+    const bool button_pressed_now = board_button_pressed();
     button_action_t button_action = BUTTON_ACTION_NONE;
-    if (button_wake || board_button_pressed()) {
+    if (button_wake && !button_pressed_now) {
+        /* A quick press can be released before app_main runs; the wake cause is authoritative. */
+        button_action = BUTTON_ACTION_SAMPLE;
+    } else if (button_wake || button_pressed_now) {
         button_action = classify_button_hold(early_battery_mv, early_battery_present);
     }
 
@@ -338,6 +356,12 @@ void app_main(void)
         .battery_present = !usb_without_battery,
     };
     soil_model_step(&policy, &sample, &state);
+    if (!usb_without_battery && cold_boot) {
+        /* Re-establish coordinator contact after battery insertion or any full power cycle. */
+        state.event_flags |= SOIL_EVENT_HEARTBEAT;
+        state.should_report = true;
+        state.seconds_since_report = 0U;
+    }
     state.last_sample_rtc_us = sample_rtc_us;
     board_led_status(state.current_sample_valid ? state.moisture_pct : NAN,
                      state.sensor_fault, manual);
@@ -356,7 +380,8 @@ void app_main(void)
 
     if (need_zigbee) {
         ESP_ERROR_CHECK(zigbee_transport_start(&policy, &state, &diag, ota_mode));
-        const uint32_t wait_ms = (manual || usb_without_battery || ota_mode || validation_boot)
+        const uint32_t wait_ms = (manual || usb_without_battery || ota_mode ||
+                                  validation_boot || cold_boot)
                                      ? COMMISSIONING_WINDOW_MS
                                      : NORMAL_ZIGBEE_WAIT_MS;
         zigbee_ready = zigbee_transport_wait_ready(wait_ms);
