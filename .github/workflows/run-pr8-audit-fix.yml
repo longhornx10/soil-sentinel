@@ -6,6 +6,7 @@ on:
       - main
     types:
       - ready_for_review
+      - synchronize
 
 permissions:
   contents: write
@@ -21,7 +22,18 @@ jobs:
           ref: feat/final-field-bundle
           fetch-depth: 0
 
+      - name: Check whether repair is already applied
+        id: state
+        shell: bash
+        run: |
+          if [ "$(git log -1 --pretty=%s)" = "fix: harden field firmware after audit" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Extract guarded patch script
+        if: steps.state.outputs.skip != 'true'
         shell: bash
         run: |
           python3 - <<'PY'
@@ -42,14 +54,17 @@ jobs:
           bash /tmp/apply-audit.sh
 
       - name: Run host tests
+        if: steps.state.outputs.skip != 'true'
         shell: bash
         run: ./scripts/test-host.sh
 
       - name: Build ESP-IDF firmware
+        if: steps.state.outputs.skip != 'true'
         shell: bash
         run: idf.py build
 
       - name: Commit repaired field bundle
+        if: steps.state.outputs.skip != 'true'
         shell: bash
         run: |
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
