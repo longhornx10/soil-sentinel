@@ -1,10 +1,8 @@
-build/
-sdkconfig
-sdkconfig.old
+/build/
+/dist/
+/sdkconfig
+/sdkconfig.old
+/dependencies.lock
 managed_components/
-dependencies.lock
-*.swp
-*.bin
-*.elf
-*.map
-.DS_Store
+__pycache__/
+*.pyc

@@ -1,115 +1,98 @@
-# Home Assistant ZHA integration
+# Home Assistant and ZHA setup
 
-Soil Sentinel deliberately uses a mixed Zigbee data model:
+## Install the custom quirk
 
-- Standard Zigbee clusters for values ZHA already understands.
-- One compact custom telemetry attribute for device-specific diagnostics and adaptive-state information.
+Copy:
 
-This keeps radio airtime low while still exposing useful state in Home Assistant.
+```text
+integrations/zha_quirks/soil_sentinel.py
+```
+
+to:
+
+```text
+/config/custom_zha_quirks/soil_sentinel.py
+```
+
+Add or merge this block in `configuration.yaml`:
+
+```yaml
+zha:
+  custom_quirks_path: /config/custom_zha_quirks
+```
+
+Restart Home Assistant after replacing the quirk. The first migration to the dual-slot firmware requires re-pairing because its partition-table change relocates Zigbee storage. Later firmware and quirk updates should not require re-pairing.
 
 ## Native entities
 
-These come from standard clusters and do not require a custom quirk:
+ZHA provides standard entities for:
 
-- Soil moisture
-- Battery percentage
-- Battery voltage
+- soil moisture
+- battery percentage
+- battery voltage
+- firmware update, when a newer image is present in the configured OTA provider
 
-The battery entities are reported only while an AA cell is present. USB bench mode intentionally reports the battery as absent rather than manufacturing a dramatic 0% battery emergency.
+## User controls
 
-## Quirk-provided entities
+The quirk adds:
 
-`integrations/zha_quirks/soil_sentinel.py` translates the compact telemetry frame into:
+- Calibration mode: Stock, Learning, Manual
+- Manual dry voltage
+- Manual wet voltage
+- Dry threshold
+- Critical threshold
+- Use current reading as dry
+- Use current reading as wet
+- Copy learned bounds to manual
+- Reset learned curve
+- Restore manual bounds to stock
+- Plant moved / restart learning
+- Identify sensor
 
-- Operating mode
-- Sensor fault
-- Current measurement valid
-- Watering observed
-- Measurement confidence
-- Drying rate
-- Sample interval
-- Raw probe voltage
-- Measurement noise
-- Valid moisture history, initially disabled
-- Time since watering, initially disabled; consult `Watering observed` to distinguish zero from no watering history
-- Report reason flags, initially disabled
-- Battery present, initially disabled
+## Sleepy-device behavior
 
-All of these values travel in one telemetry report rather than one Zigbee packet per entity. Operating-mode transitions trigger a report so Home Assistant does not retain a stale mode or sample interval between moisture-delta reports.
+Configuration controls are intentionally not instant. When a direct write fails because the sensor is asleep, the quirk caches the complete desired configuration. The next telemetry report triggers another write while the sensor is awake.
 
-`Current measurement valid` distinguishes an electrically invalid sample from a noisy but finite sample. A noisy finite sample remains available, reports zero confidence, and raises `Sensor fault`; an electrically invalid sample publishes the native moisture value as unknown.
+The firmware applies a configuration only when it receives the final desired revision. It validates the complete candidate, persists it atomically, acknowledges the applied revision, and retains the old configuration if validation or storage fails.
 
-## Install the local quirk
+A short physical button press forces a measurement/report window and is the fastest way to deliver queued settings.
 
-1. Create a directory in the Home Assistant configuration area, for example:
+One-shot actions are best pressed immediately after waking the device. Persistent settings survive Home Assistant restarts through ZHA’s attribute cache and revision comparison; one-shot actions are deliberately not replayed indefinitely, since repeatedly declaring that a plant moved would eventually become performance art.
 
-   ```text
-   /config/custom_zha_quirks
-   ```
+## Calibration workflow
 
-2. Copy `integrations/zha_quirks/soil_sentinel.py` into that directory.
+### Learning mode
 
-3. Add the custom quirk path to `configuration.yaml`:
+1. Select **Learning**.
+2. Let the sensor observe at least two credible dry-to-water cycles.
+3. Watch Learning confidence, Learning cycles, Learned dry voltage, and Learned wet voltage.
+4. If the learned curve behaves poorly, switch to **Stock** immediately. Learned history remains available but stops affecting moisture.
+5. Use **Reset learned curve** or **Plant moved / restart learning** only when you actually want to discard it.
 
-   ```yaml
-   zha:
-     custom_quirks_path: /config/custom_zha_quirks
-   ```
+### Manual mode from logged voltage
 
-4. Restart Home Assistant completely.
+1. Enable Raw probe voltage in the device diagnostics.
+2. Record the raw value near the point you consider dry.
+3. Water normally and record the settled wet value.
+4. Enter those values in Manual dry voltage and Manual wet voltage.
+5. Select **Manual**.
 
-5. After flashing firmware that adds or changes Zigbee clusters, remove and re-pair the sensor so ZHA performs a new device interview. Merely pressing the sensor button does not make ZHA rediscover its endpoint descriptor.
+Dry voltage must be greater than wet voltage and the span must be at least 100 mV. Invalid values are rejected as one transaction; the last valid curve remains active.
 
-6. Open the device page and confirm that the applied quirk is listed as `SoilSentinelTelemetryCluster` or otherwise shows the local Soil Sentinel quirk.
+The **Use current reading as dry/wet** buttons make this faster when the device is already at the desired reference condition.
 
-Updating only the local quirk or the schema-v1 status bits documented below does not change the endpoint descriptor and therefore does not require re-pairing. Restart Home Assistant after replacing the quirk file.
+## Diagnostic entities
 
-## Expected report confirmations
+The quirk exposes, mostly as diagnostic entities:
 
-A successful state report should include confirmations similar to:
+- operating mode and active calibration mode
+- active curve source
+- active and learned voltage bounds
+- learning confidence and cycle count
+- raw voltage, noise, measurement confidence, and drying rate
+- sample interval and time since watering
+- pending/applied configuration state and rejection result
+- OTA state, result, progress, active slot, validation-pending state, and firmware file version
+- report-reason flags and validity/history indicators
 
-```text
-moisture report confirmed: ... cluster=0x000c
-telemetry report confirmed: ... cluster=0xfc00
-battery percentage report confirmed: ... cluster=0x0001
-battery voltage report confirmed: ... cluster=0x0001
-```
-
-USB bench mode omits the two battery reports because no AA is installed.
-
-## Telemetry schema v1
-
-The custom cluster is `0xFC00`, attribute `0x0000`, encoded as a 21-byte ZCL octet string payload:
-
-| Offset | Size | Value |
-|---:|---:|---|
-| 0 | 1 | Schema version |
-| 1 | 1 | Operating mode |
-| 2 | 2 | Report reason and persistent-status flags, little-endian |
-| 4 | 1 | Sensor fault |
-| 5 | 1 | Confidence percent |
-| 6 | 2 | Raw probe millivolts |
-| 8 | 2 | Measurement noise millivolts |
-| 10 | 2 | Drying rate in hundredths of percent per hour |
-| 12 | 4 | Adaptive sample interval in seconds |
-| 16 | 4 | Seconds since detected watering |
-| 20 | 1 | Battery present |
-
-The 16-bit flags field uses:
-
-| Bit | Meaning |
-|---:|---|
-| 0 | Moisture threshold or report-delta event |
-| 1 | Watering detected |
-| 2 | Sensor fault changed |
-| 3 | Heartbeat |
-| 4 | Battery state changed |
-| 5 | Manual measurement |
-| 6 | Operating mode or adaptive sample interval changed |
-| 8 | Current sample electrically valid |
-| 9 | At least one valid moisture sample exists |
-| 10 | Watering has been observed since state initialization |
-
-Bit 7 and bits 11–15 are reserved. The quirk masks persistent status bits out of the user-facing report-reason entity.
-
-The first byte visible to the C implementation is the ZCL octet-string length prefix and is not part of the 21-byte payload consumed by the Python quirk.
+Enable only the diagnostics you actually use. Forty entities do not make a fern more scientific.

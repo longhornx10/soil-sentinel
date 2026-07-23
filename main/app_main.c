@@ -1,16 +1,19 @@
 #include <inttypes.h>
 #include <math.h>
+#include <sys/time.h>
 #include "board.h"
+#include "firmware_update.h"
 #include "storage.h"
 #include "zigbee_transport.h"
 #include "soil_model.h"
+#include "soil_service.h"
 #include "soil_telemetry.h"
 #include "driver/gpio.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
 #include "esp_sleep.h"
-#include "esp_private/esp_clk.h"
+#include "esp_system.h"
 
 #define NORMAL_ZIGBEE_WAIT_MS 20000U
 #define COMMISSIONING_WINDOW_MS 120000U
@@ -20,10 +23,32 @@
 #define USB_NO_BATTERY_THRESHOLD_MV 500.0f
 #define USB_BUTTON_POLL_MS 20U
 #define USB_BUTTON_DEBOUNCE_MS 30U
-#define CHECKPOINT_EVENT_MASK (SOIL_EVENT_THRESHOLD | SOIL_EVENT_WATERING | SOIL_EVENT_FAULT | \
-                               SOIL_EVENT_HEARTBEAT | SOIL_EVENT_BATTERY)
+#define USB_BATTERY_RECHECK_MS 1000U
+#define CONFIG_DELIVERY_WINDOW_MS 5000U
+#define OTA_SERVICE_WINDOW_MS (15U * 60U * 1000U)
+#define OTA_WAIT_INDICATOR_MS 30000U
+#define BUTTON_OTA_HOLD_MS 3000U
+#define BUTTON_RESET_WARNING_MS 15000U
+#define BUTTON_FACTORY_RESET_MS 20000U
+#define CHECKPOINT_EVENT_MASK (SOIL_EVENT_THRESHOLD | SOIL_EVENT_WATERING | \
+                               SOIL_EVENT_FAULT | SOIL_EVENT_HEARTBEAT | \
+                               SOIL_EVENT_BATTERY | SOIL_EVENT_CONFIG)
+
+typedef soil_service_button_action_t button_action_t;
+#define BUTTON_ACTION_NONE          SOIL_SERVICE_BUTTON_NONE
+#define BUTTON_ACTION_SAMPLE        SOIL_SERVICE_BUTTON_SAMPLE
+#define BUTTON_ACTION_OTA           SOIL_SERVICE_BUTTON_OTA
+#define BUTTON_ACTION_OTA_REFUSED   SOIL_SERVICE_BUTTON_OTA_REFUSED
+#define BUTTON_ACTION_FACTORY_RESET SOIL_SERVICE_BUTTON_FACTORY_RESET
 
 static const char *TAG = "soil-sentinel";
+
+static uint64_t current_time_us(void)
+{
+    struct timeval now = {0};
+    if (gettimeofday(&now, NULL) != 0) return 0U;
+    return (uint64_t)now.tv_sec * 1000000ULL + (uint64_t)now.tv_usec;
+}
 
 static uint32_t elapsed_seconds_between(uint64_t now_us, uint64_t before_us)
 {
@@ -42,125 +67,235 @@ static void enter_sleep(uint32_t seconds)
     esp_deep_sleep_start();
 }
 
-static void log_sample(const soil_state_t *state, const board_measurement_t *measurement)
+static button_action_t classify_button_hold(float battery_mv, bool battery_present)
+{
+    if (!board_button_pressed()) return BUTTON_ACTION_NONE;
+    vTaskDelay(pdMS_TO_TICKS(USB_BUTTON_DEBOUNCE_MS));
+    if (!board_button_pressed()) return BUTTON_ACTION_NONE;
+
+    uint32_t held_ms = USB_BUTTON_DEBOUNCE_MS;
+    bool ota_announced = false;
+    bool reset_warning = false;
+    const bool ota_safe = !battery_present || battery_mv >= SOIL_OTA_MIN_BATTERY_MV;
+
+    while (board_button_pressed() && held_ms < BUTTON_FACTORY_RESET_MS) {
+        vTaskDelay(pdMS_TO_TICKS(USB_BUTTON_POLL_MS));
+        held_ms += USB_BUTTON_POLL_MS;
+        if (!ota_announced && held_ms >= BUTTON_OTA_HOLD_MS) {
+            ota_announced = true;
+            if (ota_safe) {
+                board_indicator_ota_ready();
+            } else {
+                board_indicator_ota_low_battery();
+            }
+        }
+        if (!reset_warning && held_ms >= BUTTON_RESET_WARNING_MS) {
+            reset_warning = true;
+            board_indicator_factory_reset_warning();
+        }
+    }
+
+    while (board_button_pressed()) {
+        vTaskDelay(pdMS_TO_TICKS(USB_BUTTON_POLL_MS));
+        held_ms += USB_BUTTON_POLL_MS;
+        if (held_ms >= BUTTON_FACTORY_RESET_MS) {
+            board_indicator_factory_reset_confirmed();
+            while (board_button_pressed()) {
+                vTaskDelay(pdMS_TO_TICKS(USB_BUTTON_POLL_MS));
+            }
+            return BUTTON_ACTION_FACTORY_RESET;
+        }
+    }
+
+    return soil_service_classify_button(
+        true, held_ms, battery_present, battery_mv, SOIL_OTA_MIN_BATTERY_MV,
+        BUTTON_OTA_HOLD_MS, BUTTON_FACTORY_RESET_MS);
+}
+
+static void log_sample(const soil_policy_t *policy,
+                       const soil_state_t *state,
+                       const board_measurement_t *measurement)
 {
     ESP_LOGI(TAG,
              "moisture=%.1f%% battery=%s%.1f%% raw=%.0fmV noise=%.1fmV confidence=%.0f%% "
-             "mode=%s interval=%" PRIu32 "s events=0x%02" PRIx32 " fault=%s valid=%s report=%s",
-             state->moisture_pct, state->battery_present ? "" : "n/a ", state->battery_pct,
-             measurement->soil_mv, measurement->noise_mv, state->confidence_pct,
-             soil_mode_name(state->mode), state->sample_interval_seconds, state->event_flags,
-             state->sensor_fault ? "yes" : "no", state->current_sample_valid ? "yes" : "no",
-             state->should_report ? "yes" : "no");
+             "mode=%s calibration=%s curve=%s interval=%" PRIu32 "s events=0x%02" PRIx32,
+             state->moisture_pct,
+             state->battery_present ? "" : "n/a ",
+             state->battery_pct,
+             measurement->soil_mv,
+             measurement->noise_mv,
+             state->confidence_pct,
+             soil_mode_name(state->mode),
+             soil_calibration_mode_name(policy->calibration_mode),
+             soil_curve_source_name(state->active_curve_source),
+             state->sample_interval_seconds,
+             state->event_flags);
 }
 
-static esp_err_t publish_with_retry(const soil_state_t *state, const board_measurement_t *measurement)
+static esp_err_t publish_with_retry(const soil_state_t *state,
+                                    const board_measurement_t *measurement)
 {
     soil_diagnostics_t diag = {
         .raw_mv = measurement->soil_mv,
         .battery_mv = measurement->battery_mv,
         .noise_mv = measurement->noise_mv,
     };
-    soil_state_t reported_state = *state;
-    reported_state.event_flags = soil_telemetry_flags(&reported_state);
-    if (!reported_state.current_sample_valid) {
-        /* ZCL single precision represents unknown as NaN. Keep last-good state internally. */
-        reported_state.moisture_pct = NAN;
-    }
-
-    esp_err_t publish_err = zigbee_transport_publish(&reported_state, &diag);
-    if (publish_err != ESP_OK) {
-        ESP_LOGW(TAG, "Zigbee report delivery failed; retrying once in %u ms", REPORT_RETRY_DELAY_MS);
+    esp_err_t err = zigbee_transport_publish(state, &diag);
+    if (err != ESP_OK) {
         vTaskDelay(pdMS_TO_TICKS(REPORT_RETRY_DELAY_MS));
-        publish_err = zigbee_transport_publish(&reported_state, &diag);
+        err = zigbee_transport_publish(state, &diag);
     }
-
-    if (publish_err == ESP_OK) {
-        ESP_LOGI(TAG, "Zigbee state report delivery confirmed");
-    } else {
-        ESP_LOGE(TAG, "Zigbee state report delivery failed after retry");
-    }
-    return publish_err;
+    return err;
 }
 
-static void save_state(const soil_policy_t *policy, soil_state_t *state, esp_err_t publish_err)
+static void save_state(const soil_policy_t *policy,
+                       soil_state_t *state,
+                       esp_err_t publish_err)
 {
     if (state->should_report && publish_err != ESP_OK) {
-        /* Force another report attempt instead of treating this sample as delivered. */
         state->seconds_since_report = policy->heartbeat_seconds;
     }
-
     storage_save_runtime(state);
-
-    /* Manual-only checks stay in RTC state and do not consume an NVS write. */
-    if ((state->event_flags & CHECKPOINT_EVENT_MASK) != 0) {
-        (void)storage_save_checkpoint(state);
+    if ((state->event_flags & CHECKPOINT_EVENT_MASK) != 0U) {
+        (void)storage_save_checkpoint(policy, state);
     }
 }
 
-static void stay_awake_for_usb(const soil_policy_t *policy, soil_state_t *state, bool zigbee_ready)
+static void refresh_current_moisture(const soil_policy_t *policy,
+                                     soil_state_t *state,
+                                     const board_measurement_t *measurement)
 {
-    ESP_LOGI(TAG, "USB bench mode: no battery detected; staying awake for monitor and flashing");
-    ESP_LOGI(TAG, "USB bench mode: press the large sensor button for a fresh sample and Zigbee report");
+    soil_resolve_active_curve(policy, state);
+    const float value = soil_calibrated_percent(measurement->soil_mv,
+                                                state->active_dry_raw_mv,
+                                                state->active_wet_raw_mv);
+    if (isfinite(value)) {
+        state->previous_moisture_pct = state->moisture_pct;
+        state->moisture_pct = value;
+        state->last_reported_pct = value;
+    }
+}
 
+static esp_err_t service_queued_configuration(soil_policy_t *policy,
+                                               soil_state_t *state,
+                                               board_measurement_t *measurement)
+{
+    esp_err_t final_err = ESP_OK;
+    if (zigbee_transport_wait_config_change(CONFIG_DELIVERY_WINDOW_MS)) {
+        refresh_current_moisture(policy, state, measurement);
+        final_err = publish_with_retry(state, measurement);
+        (void)storage_save_checkpoint(policy, state);
+    }
+    if (zigbee_transport_take_identify_request()) {
+        board_indicator_identify();
+    }
+    return final_err;
+}
+
+static void run_ota_service_window(soil_policy_t *policy,
+                                   soil_state_t *state,
+                                   board_measurement_t *measurement)
+{
+    firmware_update_arm();
+    if (zigbee_transport_begin_ota_query() != ESP_OK) {
+        firmware_update_timeout();
+        board_indicator_ota_failure();
+        return;
+    }
+
+    uint32_t elapsed_ms = 0U;
+    uint32_t indicator_ms = 0U;
+    while (elapsed_ms < OTA_SERVICE_WINDOW_MS) {
+        vTaskDelay(pdMS_TO_TICKS(250U));
+        elapsed_ms += 250U;
+        indicator_ms += 250U;
+
+        if (zigbee_transport_wait_config_change(0U)) {
+            refresh_current_moisture(policy, state, measurement);
+            (void)publish_with_retry(state, measurement);
+            (void)storage_save_checkpoint(policy, state);
+        }
+        if (zigbee_transport_take_identify_request()) board_indicator_identify();
+
+        const soil_ota_state_t ota_state = firmware_update_state();
+        if (ota_state == SOIL_OTA_STATE_FAILED ||
+            ota_state == SOIL_OTA_STATE_REFUSED) {
+            return;
+        }
+        if (indicator_ms >= OTA_WAIT_INDICATOR_MS &&
+            ota_state != SOIL_OTA_STATE_DOWNLOADING) {
+            board_indicator_ota_waiting();
+            indicator_ms = 0U;
+        }
+    }
+
+    firmware_update_timeout();
+    board_indicator_ota_failure();
+}
+
+static void stay_awake_for_usb(soil_policy_t *policy,
+                               soil_state_t *state,
+                               bool zigbee_ready)
+{
+    ESP_LOGI(TAG, "USB bench mode: no battery detected; staying awake");
+    uint32_t battery_recheck_ms = 0U;
     while (true) {
         if (!board_button_pressed()) {
             vTaskDelay(pdMS_TO_TICKS(USB_BUTTON_POLL_MS));
+            battery_recheck_ms += USB_BUTTON_POLL_MS;
+            if (battery_recheck_ms >= USB_BATTERY_RECHECK_MS) {
+                float battery_mv = 0.0f;
+                battery_recheck_ms = 0U;
+                if (board_read_battery_mv(&battery_mv) == ESP_OK &&
+                    battery_mv >= USB_NO_BATTERY_THRESHOLD_MV) {
+                    ESP_LOGI(TAG, "AA battery detected in USB bench mode; restarting into battery mode");
+                    esp_restart();
+                }
+            }
+            if (zigbee_ready && zigbee_transport_wait_config_change(0U)) {
+                board_measurement_t current;
+                if (board_measure(&current) == ESP_OK) {
+                    refresh_current_moisture(policy, state, &current);
+                    (void)publish_with_retry(state, &current);
+                    (void)storage_save_checkpoint(policy, state);
+                }
+            }
+            if (zigbee_transport_take_identify_request()) board_indicator_identify();
             continue;
         }
 
-        vTaskDelay(pdMS_TO_TICKS(USB_BUTTON_DEBOUNCE_MS));
-        if (!board_button_pressed()) {
-            continue;
+        battery_recheck_ms = 0U;
+        const button_action_t action = classify_button_hold(0.0f, false);
+        if (action == BUTTON_ACTION_FACTORY_RESET) {
+            (void)storage_factory_reset(true);
+            esp_restart();
         }
-
-        /* One action per press. Wait for release before measuring. */
-        while (board_button_pressed()) {
-            vTaskDelay(pdMS_TO_TICKS(USB_BUTTON_POLL_MS));
-        }
-
-        ESP_LOGI(TAG, "USB bench button pressed; taking a fresh manual sample");
-
-        const uint64_t sample_rtc_us = esp_clk_rtc_time();
-        const uint32_t elapsed_seconds = elapsed_seconds_between(sample_rtc_us, state->last_sample_rtc_us);
+        if (action != BUTTON_ACTION_SAMPLE) continue;
 
         board_measurement_t measurement;
-        const esp_err_t measure_err = board_measure(&measurement);
-        if (measure_err != ESP_OK) {
-            ESP_LOGE(TAG, "USB bench measurement failed: %s", esp_err_to_name(measure_err));
-            continue;
-        }
-
+        if (board_measure(&measurement) != ESP_OK) continue;
+        const uint64_t now_us = current_time_us();
         soil_sample_t sample = {
             .raw_mv = measurement.soil_mv,
             .battery_mv = measurement.battery_mv,
             .noise_mv = measurement.noise_mv,
-            .elapsed_seconds = elapsed_seconds,
+            .elapsed_seconds = elapsed_seconds_between(now_us, state->last_sample_rtc_us),
             .manual_sample = true,
             .battery_present = false,
         };
         soil_model_step(policy, &sample, state);
-        state->last_sample_rtc_us = sample_rtc_us;
+        log_sample(policy, state, &measurement);
+        state->last_sample_rtc_us = now_us;
         board_led_status(state->current_sample_valid ? state->moisture_pct : NAN,
                          state->sensor_fault, true);
-        log_sample(state, &measurement);
-
         if (!zigbee_ready) {
-            ESP_LOGI(TAG, "USB bench mode: waiting for Zigbee before manual report");
             zigbee_ready = zigbee_transport_wait_ready(COMMISSIONING_WINDOW_MS);
         }
-
-        esp_err_t publish_err = ESP_ERR_INVALID_STATE;
         if (zigbee_ready) {
-            publish_err = publish_with_retry(state, &measurement);
-            vTaskDelay(pdMS_TO_TICKS(REPORT_SETTLE_MS));
-            board_pairing_indicator_off();
-        } else {
-            ESP_LOGW(TAG, "USB bench manual sample retained because Zigbee is not ready");
+            (void)publish_with_retry(state, &measurement);
+            (void)service_queued_configuration(policy, state, &measurement);
         }
-
-        save_state(policy, state, publish_err);
-        vTaskDelay(pdMS_TO_TICKS(USB_BUTTON_DEBOUNCE_MS));
+        save_state(policy, state, ESP_OK);
     }
 }
 
@@ -170,34 +305,55 @@ void app_main(void)
     const bool deep_sleep_wake = wake_cause == ESP_SLEEP_WAKEUP_TIMER ||
                                  wake_cause == ESP_SLEEP_WAKEUP_EXT1;
     const bool button_wake = wake_cause == ESP_SLEEP_WAKEUP_EXT1;
-    if (deep_sleep_wake) {
-        /* Routine battery wakes should not spend energy formatting informational logs. */
-        esp_log_level_set("*", ESP_LOG_WARN);
-    }
+    const bool cold_boot = !deep_sleep_wake;
+    if (deep_sleep_wake) esp_log_level_set("*", ESP_LOG_WARN);
 
     ESP_ERROR_CHECK(storage_init());
     ESP_ERROR_CHECK(board_init());
+    ESP_ERROR_CHECK(firmware_update_init());
 
     soil_policy_t policy;
     soil_state_t state;
     ESP_ERROR_CHECK(storage_load(&policy, &state));
 
-    const uint64_t sample_rtc_us = esp_clk_rtc_time();
-    uint32_t elapsed_seconds = deep_sleep_wake
-                                   ? elapsed_seconds_between(sample_rtc_us, state.last_sample_rtc_us)
-                                   : 0U;
-    if (wake_cause == ESP_SLEEP_WAKEUP_TIMER && elapsed_seconds == 0U) {
-        /* Safe fallback for the first wake after a retained-state schema change. */
-        elapsed_seconds = state.sample_interval_seconds;
+    float early_battery_mv = 0.0f;
+    ESP_ERROR_CHECK(board_read_battery_mv(&early_battery_mv));
+    const bool early_battery_present = early_battery_mv >= USB_NO_BATTERY_THRESHOLD_MV;
+    const bool button_pressed_now = board_button_pressed();
+    button_action_t button_action = BUTTON_ACTION_NONE;
+    if (button_wake && !button_pressed_now) {
+        /* A quick press can be released before app_main runs; the wake cause is authoritative. */
+        button_action = BUTTON_ACTION_SAMPLE;
+    } else if (button_wake || button_pressed_now) {
+        button_action = classify_button_hold(early_battery_mv, early_battery_present);
+    }
+
+    if (button_action == BUTTON_ACTION_FACTORY_RESET) {
+        ESP_ERROR_CHECK(storage_factory_reset(true));
+        esp_restart();
+    }
+    if (button_action == BUTTON_ACTION_OTA_REFUSED) {
+        firmware_update_refuse_low_battery();
+        enter_sleep(state.sample_interval_seconds ? state.sample_interval_seconds
+                                                  : policy.stable_sample_seconds);
     }
 
     board_measurement_t measurement;
     ESP_ERROR_CHECK(board_measure(&measurement));
-    const bool manual = button_wake || board_button_pressed();
-    /* The supported service workflow removes the AA before USB power is attached. */
     const bool usb_without_battery = measurement.battery_mv < USB_NO_BATTERY_THRESHOLD_MV;
     esp_log_level_set("*", usb_without_battery ? ESP_LOG_INFO : ESP_LOG_WARN);
 
+    const uint64_t sample_rtc_us = current_time_us();
+    uint32_t elapsed_seconds = deep_sleep_wake
+                                   ? elapsed_seconds_between(sample_rtc_us,
+                                                             state.last_sample_rtc_us)
+                                   : 0U;
+    if (wake_cause == ESP_SLEEP_WAKEUP_TIMER && elapsed_seconds == 0U) {
+        elapsed_seconds = state.sample_interval_seconds;
+    }
+
+    const bool manual = button_action == BUTTON_ACTION_SAMPLE;
+    const bool ota_mode = button_action == BUTTON_ACTION_OTA;
     soil_sample_t sample = {
         .raw_mv = measurement.soil_mv,
         .battery_mv = measurement.battery_mv,
@@ -207,36 +363,69 @@ void app_main(void)
         .battery_present = !usb_without_battery,
     };
     soil_model_step(&policy, &sample, &state);
+    if (!usb_without_battery && cold_boot) {
+        /* Re-establish coordinator contact after battery insertion or any full power cycle. */
+        state.event_flags |= SOIL_EVENT_HEARTBEAT;
+        state.should_report = true;
+        state.seconds_since_report = 0U;
+    }
     state.last_sample_rtc_us = sample_rtc_us;
     board_led_status(state.current_sample_valid ? state.moisture_pct : NAN,
                      state.sensor_fault, manual);
-    log_sample(&state, &measurement);
+    log_sample(&policy, &state, &measurement);
 
+    soil_diagnostics_t diag = {
+        .raw_mv = measurement.soil_mv,
+        .battery_mv = measurement.battery_mv,
+        .noise_mv = measurement.noise_mv,
+    };
+    const bool validation_boot = firmware_update_needs_boot_validation();
+    const bool need_zigbee = state.should_report || usb_without_battery ||
+                              ota_mode || validation_boot;
     bool zigbee_ready = false;
     esp_err_t publish_err = ESP_OK;
 
-    if (state.should_report || usb_without_battery) {
-        ESP_ERROR_CHECK(zigbee_transport_start());
-        const uint32_t wait_ms = (manual || usb_without_battery) ? COMMISSIONING_WINDOW_MS : NORMAL_ZIGBEE_WAIT_MS;
-        ESP_LOGI(TAG, "Zigbee commissioning/report window: %" PRIu32 " ms", wait_ms);
+    if (need_zigbee) {
+        ESP_ERROR_CHECK(zigbee_transport_start(&policy, &state, &diag, ota_mode));
+        const uint32_t wait_ms = (manual || usb_without_battery || ota_mode ||
+                                  validation_boot || cold_boot)
+                                     ? COMMISSIONING_WINDOW_MS
+                                     : NORMAL_ZIGBEE_WAIT_MS;
         zigbee_ready = zigbee_transport_wait_ready(wait_ms);
-
         if (zigbee_ready) {
             const bool paired_now = board_pairing_indicator_is_success();
-            if (state.should_report) {
+            publish_err = publish_with_retry(&state, &measurement);
+            if (publish_err == ESP_OK) {
+                const esp_err_t config_err = service_queued_configuration(
+                    &policy, &state, &measurement);
+                if (config_err != ESP_OK) publish_err = config_err;
+            }
+            if (validation_boot && publish_err == ESP_OK) {
+                ESP_ERROR_CHECK(firmware_update_mark_running_valid());
+                /* Publish the accepted slot/result immediately instead of leaving HA
+                 * with a stale "validation pending" diagnostic until tomorrow. */
                 publish_err = publish_with_retry(&state, &measurement);
             }
-            vTaskDelay(pdMS_TO_TICKS(paired_now ? PAIRING_RESULT_LED_MS : REPORT_SETTLE_MS));
+            vTaskDelay(pdMS_TO_TICKS(paired_now ? PAIRING_RESULT_LED_MS
+                                                : REPORT_SETTLE_MS));
             board_pairing_indicator_off();
+
+            if (ota_mode) {
+                float loaded_battery_mv = measurement.battery_mv;
+                const bool loaded_battery_safe =
+                    !state.battery_present ||
+                    (board_read_battery_mv(&loaded_battery_mv) == ESP_OK &&
+                     loaded_battery_mv >= SOIL_OTA_MIN_BATTERY_MV);
+                if (!loaded_battery_safe) {
+                    firmware_update_refuse_low_battery();
+                    board_indicator_ota_low_battery();
+                } else {
+                    measurement.battery_mv = loaded_battery_mv;
+                    run_ota_service_window(&policy, &state, &measurement);
+                }
+            }
         } else {
             publish_err = ESP_ERR_TIMEOUT;
-            const bool pairing_failed = board_pairing_indicator_is_searching();
-            ESP_LOGW(TAG, "Zigbee unavailable after %" PRIu32 " ms; retaining state and backing off", wait_ms);
-            if (pairing_failed) {
-                board_pairing_indicator_failure();
-                vTaskDelay(pdMS_TO_TICKS(PAIRING_RESULT_LED_MS));
-                board_pairing_indicator_off();
-            }
             if (!usb_without_battery && state.sample_interval_seconds < 3600U) {
                 state.sample_interval_seconds = 3600U;
             }
@@ -244,10 +433,7 @@ void app_main(void)
     }
 
     save_state(&policy, &state, publish_err);
-
-    if (usb_without_battery) {
-        stay_awake_for_usb(&policy, &state, zigbee_ready);
-    }
-
-    enter_sleep(state.sample_interval_seconds ? state.sample_interval_seconds : policy.stable_sample_seconds);
+    if (usb_without_battery) stay_awake_for_usb(&policy, &state, zigbee_ready);
+    enter_sleep(state.sample_interval_seconds ? state.sample_interval_seconds
+                                              : policy.stable_sample_seconds);
 }

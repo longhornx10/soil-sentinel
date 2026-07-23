@@ -1,36 +1,63 @@
 # Soil Sentinel
 
-Native ESP-IDF firmware for the Seeed Studio XIAO ESP32-C6 Soil Moisture Sensor, focused on calibrated readings, Zigbee, local event intelligence, and long AA battery life.
+Native ESP-IDF firmware for the Seeed Studio XIAO ESP32-C6 Soil Moisture Sensor. It provides native Zigbee reporting, three moisture-calibration modes, queued Home Assistant controls, manually armed Zigbee OTA updates, and aggressive deep-sleep power management for one alkaline AA cell.
 
-## Current capabilities
+## Field-ready 1.0 bundle
 
-- Native ESP-IDF 5.5.4 project for ESP32-C6
-- ESP Zigbee SDK 2.x sleepy end-device transport
+- ESP-IDF 5.5.4 and ESP Zigbee SDK 2.x sleepy-end-device firmware
 - No Wi-Fi initialization or Wi-Fi runtime
-- External 2.4 GHz antenna selection matching the Seeed carrier
-- Factory-style 200 kHz probe excitation with a one-second analog settling period
-- Ten settled, filtered ADC readings per measurement
-- Calibrated 0–100% soil moisture score
-- Piecewise alkaline-AA battery estimate
-- Standard Zigbee moisture, battery percentage, and battery voltage attributes
-- Compact custom Zigbee telemetry for adaptive state and diagnostics
-- Included ZHA quirk for Home Assistant diagnostic entities
-- Watering-event detection and time-since-watering tracking
-- Explicit current-sample validity and watering-history state
-- Drying-rate estimate and measurement-confidence score
-- Adaptive sampling modes with mode-transition reports
-- Critical-low-battery survival mode
-- Deep-sleep timer wake and physical-button wake
-- USB bench mode that remains awake and resamples from the large carrier button
-- Safe probe, LED, and RF-switch GPIO levels latched through deep sleep
-- Sparse, versioned NVS checkpoints to limit flash wear
-- Host tests for platform-independent logic
+- Dual OTA application slots with ESP-IDF rollback
+- Zigbee OTA is available only during a manually armed 15-minute service window
+- OTA entry requires a three-second button hold and a battery check before and after Zigbee starts
+- Stock, learning, and manual moisture calibration modes
+- Controller-side queuing of Home Assistant settings until the sensor next wakes
+- Atomic, revisioned configuration with last-known-good fallback
+- Manual dry/wet voltage bounds, thresholds, curve reset/copy actions, and identify action
+- Firmware, calibration, configuration, measurement, and OTA diagnostics in ZHA
+- Sparse NVS checkpoints plus RTC state across normal deep sleep
+- Deliberate 20-second physical factory reset gesture
+- Alkaline AA battery profile only
+
+## Button behavior
+
+| Gesture | Behavior |
+|---|---|
+| Short press | Take a fresh measurement, show the moisture color, and report it |
+| Hold for 3 seconds, then release | Arm Zigbee OTA mode for 15 minutes |
+| Continue holding to 15 seconds | Flash a reset warning; releasing cancels reset and enters OTA mode |
+| Continue holding to 20 seconds | Full factory reset, including Zigbee pairing |
+
+OTA entry indications:
+
+- Red, yellow, green: OTA service mode is accepted. Release the button.
+- Three red flashes: the alkaline AA voltage is below the provisional OTA-safe threshold.
+- Brief yellow blink: waiting for Home Assistant or download progress.
+- Three green flashes: image received and selected for reboot.
+- Three red flashes: OTA failed or the service window expired.
+
+The OTA battery threshold is deliberately conservative but remains a hardware-validation item. Final voltage limits must be based on a real alkaline cell measured while Zigbee is active, because batteries enjoy changing the answer when current is actually drawn.
+
+## Moisture calibration modes
+
+### Stock
+
+Uses the fixed vendor-style bounds. The current defaults are 2750 mV dry and 1200 mV wet until physical characterization replaces them.
+
+### Learning
+
+Starts on the stock curve and observes credible drying/watering cycles. It rejects invalid, noisy, implausibly narrow, and relocation-like data. A learned curve is blended in only after at least two credible cycles, adequate raw-voltage span, and minimum confidence. Switching modes does not erase learned history.
+
+### Manual
+
+Uses explicit dry and wet raw-voltage bounds supplied from Home Assistant. The full configuration is validated atomically, and an invalid request leaves the previous curve active.
+
+Home Assistant also exposes actions to use the current reading as dry or wet, copy learned bounds to manual, reset learning, restore stock manual bounds, mark the plant as moved, and identify the physical sensor.
 
 ## Power policy
 
-The probe excitation, LEDs, and Zigbee radio are not left on between measurements. Wi-Fi is never initialized. Routine battery wakes suppress informational application logging, and output GPIOs are held at known safe levels while the digital GPIO domain is powered down.
+The probe excitation, LEDs, and Zigbee radio remain off between measurements. Wi-Fi is never initialized. GPIO output levels are held through deep sleep.
 
-| State | Default sample interval |
+| State | Default interval |
 |---|---:|
 | Stable/moist | 4 hours |
 | Drying | 1 hour |
@@ -41,75 +68,48 @@ The probe excitation, LEDs, and Zigbee radio are not left on between measurement
 | Low-battery conservation | 12 hours |
 | Critical-battery survival | 12 hours |
 
-Reports are event-driven rather than sent after every sample. A heartbeat report is sent at least every 24 hours, while threshold changes, operating-mode changes, watering, faults, battery-state changes, and manual checks report immediately.
+Reports are event-driven. Threshold crossings, watering, operating-mode changes, faults, material battery transitions, configuration changes, and manual checks report immediately. A heartbeat is sent at least every 24 hours.
 
-## Local LED behavior
+## One-time migration warning
 
-A physical-button measurement shows:
+This release changes the flash map from one factory application partition to two OTA slots. The old Zigbee storage partition sits inside the new first OTA application slot, so the one-time migration **cannot preserve the existing pairing**. Each already-flashed sensor must be erased, flashed, and paired once more.
 
-- Red below 20% moisture
-- Yellow from 20% through 59.9%
-- Green at 60% or above
-- Three quick red flashes for an electrically invalid reading
+After that migration, ordinary OTA updates preserve Zigbee pairing, settings, manual calibration, and learned calibration.
 
-Routine timed samples do not illuminate the LEDs. Factory-new Zigbee steering uses a repeating red blink, pairing success uses green, and commissioning failure uses yellow.
-
-## Home Assistant entities
-
-Native ZHA discovery provides:
-
-- Soil moisture
-- Battery percentage
-- Battery voltage
-
-The included quirk additionally provides:
-
-- Operating mode
-- Sensor fault
-- Current measurement valid
-- Watering observed
-- Measurement confidence
-- Drying rate
-- Sample interval
-- Raw probe voltage
-- Measurement noise
-- Valid moisture history
-- Time since watering
-- Report reason flags
-- Battery present
-
-See [`docs/ZHA.md`](docs/ZHA.md) for installation and re-pairing instructions.
-
-## Hardware safety before first power
-
-1. Remove the AA battery before opening, flashing, or handling the board.
-2. Inspect the external antenna cable where it passes the soldered battery terminals. No terminal or solder point may press into, pierce, or abrade the antenna insulation.
-3. Re-route the antenna away from both battery contacts and add a durable insulating barrier before closing the case.
-4. Flash, monitor, and perform the first Zigbee join over USB with the AA battery removed.
-5. Install a fresh battery only after the case closes without pinching wires and the unit has passed the USB test.
-6. If a cell, board, or case becomes hot, disconnect power and retire the affected hardware until the electrical fault is identified.
-
-Firmware cannot protect against a direct mechanical short between a battery terminal and damaged antenna wiring.
-
-## Build and host tests
+Perform the migration with the AA cell removed:
 
 ```bash
-git clone https://github.com/longhornx10/soil-sentinel.git
-cd soil-sentinel
-
 source ~/esp/esp-idf/export.sh
 ./scripts/test-host.sh
 ./scripts/build.sh
-idf.py -p /dev/ttyACM0 flash monitor
-```
-
-Erase the factory firmware and Zigbee NVRAM only before the first join:
-
-```bash
 idf.py -p /dev/ttyACM0 erase-flash flash monitor
 ```
 
-Do not erase an already paired sensor during routine firmware updates.
+Do not erase flash during later routine updates.
+
+## Release build
+
+```bash
+source ~/esp/esp-idf/export.sh
+./scripts/build-release.sh
+```
+
+Outputs:
+
+- `build/soil_sentinel.bin`: raw ESP-IDF application image
+- `dist/soil-sentinel-1.0.0.ota`: Zigbee OTA container
+- `dist/index.json`: local zigpy OTA index
+- `dist/SHA256SUMS`: release checksums
+
+Bump `PROJECT_VER`, `SOIL_OTA_FILE_VERSION`, and the release-script arguments together for every OTA release. Zigbee firmware versions must increase monotonically, because apparently software needs paperwork too.
+
+## Home Assistant
+
+See:
+
+- [`docs/ZHA.md`](docs/ZHA.md) for the custom quirk and queued controls
+- [`docs/OTA.md`](docs/OTA.md) for local ZHA OTA hosting and update procedure
+- [`docs/FIELD_TEST.md`](docs/FIELD_TEST.md) for the mandatory first-board validation
 
 ## Audited pin map
 
@@ -123,15 +123,33 @@ Do not erase an already paired sensor during routine firmware updates.
 | Yellow LED | 18 | Active high; held low during sleep |
 | Green LED | 19 | Active high; held low during sleep |
 | Red LED | 20 | Active high; held low during sleep |
-| Probe excitation | 21 | 200 kHz, 174/255 duty only while measuring; held low during sleep |
+| Probe excitation | 21 | 200 kHz, 87/255 duty only while measuring; held low during sleep |
 
-GPIO12 and GPIO13 remain reserved for native USB D- and D+. GPIO9 remains a boot strap and is not used by the application.
+GPIO12 and GPIO13 remain reserved for native USB D- and D+. GPIO9 remains a boot strap and is not used.
 
-## Planned work
+## Safety
 
-- [Issue #5](https://github.com/longhornx10/soil-sentinel/issues/5): verify the already-unused Wi-Fi stack with build-map and current measurements.
-- [Issue #6](https://github.com/longhornx10/soil-sentinel/issues/6): add guarded, soil-specific adaptive self-calibration after multiple credible wet/dry cycles.
+1. Remove the AA battery before opening, flashing, or handling the board.
+2. Inspect the antenna cable where it passes the battery terminals.
+3. Prevent any terminal or solder point from pressing into or abrading the antenna insulation.
+4. Add a durable insulating barrier and close the case without pinching the cable.
+5. Perform the first flash, serial test, and pairing over USB with the AA removed.
+6. Retire any board, cell, or enclosure that becomes hot until the fault is understood.
+
+Firmware cannot prevent a mechanical short. Lithium-ion/14500 operation is not supported by this release.
 
 ## Validation status
 
-The platform-independent state engine is host-tested. Every firmware change still requires an ESP-IDF build and one physical-board test because the Zigbee stack, carrier analog front end, GPIO leakage, and actual battery consumption cannot be validated honestly by desktop unit tests alone. Embedded hardware remains committed to making confidence expensive.
+The host logic suite currently covers:
+
+- three calibration modes and fallback
+- atomic revisioned configuration
+- invalid manual bounds and thresholds
+- learning convergence, reset, and disable behavior
+- current-reading dry/wet actions
+- watering and mode transitions
+- telemetry status flags
+- alkaline low-battery behavior
+- OTA/refusal/factory-reset button policy
+
+An ESP-IDF build and physical-board validation are still mandatory before flashing all four units. Zigbee SDK APIs, partition sizes, ADC behavior, current draw, RF reliability, and rollback cannot be honestly certified by a desktop C compiler, despite the software industry’s recurring efforts to manifest hardware through confidence.
