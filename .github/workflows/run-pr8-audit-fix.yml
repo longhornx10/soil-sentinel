@@ -1,0 +1,60 @@
+name: Run PR 8 audit repair
+
+on:
+  pull_request:
+    branches:
+      - main
+    types:
+      - ready_for_review
+
+permissions:
+  contents: write
+
+jobs:
+  repair:
+    if: github.event.pull_request.number == 8
+    runs-on: ubuntu-latest
+    container: espressif/idf:release-v5.5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feat/final-field-bundle
+          fetch-depth: 0
+
+      - name: Extract guarded patch script
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          source = Path('.github/workflows/apply-soil-audit-fixes.yml').read_text()
+          marker = "      - name: Apply guarded source changes\n        shell: bash\n        run: |\n"
+          start = source.index(marker) + len(marker)
+          end = source.index("\n      - name: Run host tests", start)
+          block = source[start:end]
+          lines = []
+          for line in block.splitlines():
+              if not line.startswith("          "):
+                  raise SystemExit(f"unexpected patch-script indentation: {line!r}")
+              lines.append(line[10:])
+          Path('/tmp/apply-audit.sh').write_text('\n'.join(lines) + '\n')
+          PY
+          bash /tmp/apply-audit.sh
+
+      - name: Run host tests
+        shell: bash
+        run: ./scripts/test-host.sh
+
+      - name: Build ESP-IDF firmware
+        shell: bash
+        run: idf.py build
+
+      - name: Commit repaired field bundle
+        shell: bash
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add main/app_main.c main/board.c main/zigbee_transport.c core/src/soil_model.c tests/test_soil_model.c
+          git commit -m "fix: harden field firmware after audit"
+          git push origin HEAD:feat/final-field-bundle
