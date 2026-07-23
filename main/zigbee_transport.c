@@ -74,6 +74,7 @@
 #define COORDINATOR_SHORT_ADDRESS 0x0000U
 #define COORDINATOR_ENDPOINT 1U
 #define AF_CONFIRM_SUCCESS 0x00U
+#define ZIGBEE_LOCK_TIMEOUT_MS 2000U
 
 static const char *TAG = "zigbee";
 static EventGroupHandle_t s_events;
@@ -115,6 +116,9 @@ static uint8_t s_attr_battery_size = EZB_ZCL_POWER_CONFIG_BATTERY_SIZE_AA;
 static uint8_t s_attr_battery_quantity = 1U;
 static uint8_t s_attr_battery_rated_voltage = 15U;
 static uint8_t s_sw_build_id[33] = {0};
+static uint8_t s_manufacturer_name[sizeof("longhornx10")] = {0};
+static uint8_t s_model_identifier[sizeof("Soil Sentinel")] = {0};
+static uint8_t s_moisture_description[sizeof("Soil moisture")] = {0};
 
 typedef struct {
     EventBits_t success_bit;
@@ -142,6 +146,18 @@ static report_confirm_context_t s_telemetry_confirm = {
     .failure_bit = REPORT_TELEMETRY_FAILED_BIT,
     .name = "telemetry",
 };
+
+static bool init_zcl_string(uint8_t *destination,
+                            size_t capacity,
+                            const char *value)
+{
+    if (!destination || !value || capacity == 0U) return false;
+    const size_t length = strlen(value);
+    if (length > UINT8_MAX || length + 1U > capacity) return false;
+    destination[0] = (uint8_t)length;
+    memcpy(&destination[1], value, length);
+    return true;
+}
 
 static uint16_t clamp_u16(float value)
 {
@@ -242,6 +258,15 @@ static esp_err_t init_zigbee_storage(void)
     return err;
 }
 
+static bool acquire_zigbee_lock(const char *operation)
+{
+    if (esp_zigbee_lock_acquire(pdMS_TO_TICKS(ZIGBEE_LOCK_TIMEOUT_MS))) {
+        return true;
+    }
+    ESP_LOGE(TAG, "timed out acquiring Zigbee lock for %s", operation);
+    return false;
+}
+
 static ezb_err_t start_commissioning(ezb_bdb_comm_mode_mask_t mode,
                                      const char *reason)
 {
@@ -261,7 +286,11 @@ static void commissioning_retry_task(void *arg)
     (void)arg;
     vTaskDelay(pdMS_TO_TICKS(COMMISSIONING_RETRY_DELAY_MS));
     const ezb_bdb_comm_mode_mask_t mode = s_retry_mode;
-    esp_zigbee_lock_acquire(portMAX_DELAY);
+    if (!acquire_zigbee_lock("commissioning retry")) {
+        s_retry_pending = false;
+        vTaskDelete(NULL);
+        return;
+    }
     const ezb_err_t err = start_commissioning(mode, "scheduled retry");
     esp_zigbee_lock_release();
     s_retry_pending = false;
@@ -545,6 +574,19 @@ static void initialize_desired_values(void)
 static esp_err_t create_device(void)
 {
     initialize_desired_values();
+    ESP_RETURN_ON_FALSE(
+        init_zcl_string(s_manufacturer_name, sizeof(s_manufacturer_name),
+                        "longhornx10"),
+        ESP_ERR_INVALID_SIZE, TAG, "manufacturer string is too long");
+    ESP_RETURN_ON_FALSE(
+        init_zcl_string(s_model_identifier, sizeof(s_model_identifier),
+                        "Soil Sentinel"),
+        ESP_ERR_INVALID_SIZE, TAG, "model string is too long");
+    ESP_RETURN_ON_FALSE(
+        init_zcl_string(s_moisture_description,
+                        sizeof(s_moisture_description),
+                        "Soil moisture"),
+        ESP_ERR_INVALID_SIZE, TAG, "description string is too long");
     ezb_af_device_desc_t device = ezb_af_create_device_desc();
     ESP_RETURN_ON_FALSE(device, ESP_ERR_NO_MEM, TAG, "device descriptor allocation failed");
     ezb_af_ep_config_t ep_cfg = {
@@ -563,9 +605,9 @@ static esp_err_t create_device(void)
     ezb_zcl_cluster_desc_t basic = ezb_zcl_basic_create_cluster_desc(
         &basic_cfg, EZB_ZCL_CLUSTER_SERVER);
     ezb_zcl_basic_cluster_desc_add_attr(basic,
-        EZB_ZCL_ATTR_BASIC_MANUFACTURER_NAME_ID, (void *)"\x0b""longhornx10");
+        EZB_ZCL_ATTR_BASIC_MANUFACTURER_NAME_ID, s_manufacturer_name);
     ezb_zcl_basic_cluster_desc_add_attr(basic,
-        EZB_ZCL_ATTR_BASIC_MODEL_IDENTIFIER_ID, (void *)"\x0d""Soil Sentinel");
+        EZB_ZCL_ATTR_BASIC_MODEL_IDENTIFIER_ID, s_model_identifier);
     ezb_zcl_basic_cluster_desc_add_attr(basic,
         EZB_ZCL_ATTR_BASIC_SW_BUILD_ID, s_sw_build_id);
 
@@ -589,7 +631,7 @@ static esp_err_t create_device(void)
     ezb_zcl_analog_input_cluster_desc_add_attr(moisture,
         EZB_ZCL_ATTR_ANALOG_INPUT_ENGINEERING_UNITS_ID, &s_attr_engineering_units);
     ezb_zcl_analog_input_cluster_desc_add_attr(moisture,
-        EZB_ZCL_ATTR_ANALOG_INPUT_DESCRIPTION_ID, (void *)"\x0d""Soil moisture");
+        EZB_ZCL_ATTR_ANALOG_INPUT_DESCRIPTION_ID, s_moisture_description);
 
     ezb_zcl_cluster_desc_t power = ezb_zcl_power_config_create_cluster_desc(
         NULL, EZB_ZCL_CLUSTER_SERVER);
@@ -804,7 +846,7 @@ esp_err_t zigbee_transport_publish(const soil_state_t *state,
                                                                      : 0x00U;
     encode_telemetry(state, diag);
 
-    esp_zigbee_lock_acquire(portMAX_DELAY);
+    if (!acquire_zigbee_lock("state publish")) return ESP_ERR_TIMEOUT;
     sync_control_cluster();
     const ezb_zcl_status_t moisture_status = ezb_zcl_set_attr_value(
         ENDPOINT_ID, EZB_ZCL_CLUSTER_ID_ANALOG_INPUT, EZB_ZCL_CLUSTER_SERVER,
@@ -900,7 +942,7 @@ bool zigbee_transport_take_identify_request(void)
 esp_err_t zigbee_transport_begin_ota_query(void)
 {
     if (!s_ota_mode || !s_events) return ESP_ERR_INVALID_STATE;
-    esp_zigbee_lock_acquire(portMAX_DELAY);
+    if (!acquire_zigbee_lock("OTA image query")) return ESP_ERR_TIMEOUT;
     const esp_err_t err = firmware_update_request_image(ENDPOINT_ID);
     esp_zigbee_lock_release();
     return err;

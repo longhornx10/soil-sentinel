@@ -1,5 +1,6 @@
 #include <inttypes.h>
 #include <math.h>
+#include <sys/time.h>
 #include "board.h"
 #include "firmware_update.h"
 #include "storage.h"
@@ -12,7 +13,6 @@
 #include "freertos/task.h"
 #include "esp_log.h"
 #include "esp_sleep.h"
-#include "esp_private/esp_clk.h"
 #include "esp_system.h"
 
 #define NORMAL_ZIGBEE_WAIT_MS 20000U
@@ -42,6 +42,13 @@ typedef soil_service_button_action_t button_action_t;
 #define BUTTON_ACTION_FACTORY_RESET SOIL_SERVICE_BUTTON_FACTORY_RESET
 
 static const char *TAG = "soil-sentinel";
+
+static uint64_t current_time_us(void)
+{
+    struct timeval now = {0};
+    if (gettimeofday(&now, NULL) != 0) return 0U;
+    return (uint64_t)now.tv_sec * 1000000ULL + (uint64_t)now.tv_usec;
+}
 
 static uint32_t elapsed_seconds_between(uint64_t now_us, uint64_t before_us)
 {
@@ -267,7 +274,7 @@ static void stay_awake_for_usb(soil_policy_t *policy,
 
         board_measurement_t measurement;
         if (board_measure(&measurement) != ESP_OK) continue;
-        const uint64_t now_us = esp_clk_rtc_time();
+        const uint64_t now_us = current_time_us();
         soil_sample_t sample = {
             .raw_mv = measurement.soil_mv,
             .battery_mv = measurement.battery_mv,
@@ -336,7 +343,7 @@ void app_main(void)
     const bool usb_without_battery = measurement.battery_mv < USB_NO_BATTERY_THRESHOLD_MV;
     esp_log_level_set("*", usb_without_battery ? ESP_LOG_INFO : ESP_LOG_WARN);
 
-    const uint64_t sample_rtc_us = esp_clk_rtc_time();
+    const uint64_t sample_rtc_us = current_time_us();
     uint32_t elapsed_seconds = deep_sleep_wake
                                    ? elapsed_seconds_between(sample_rtc_us,
                                                              state.last_sample_rtc_us)

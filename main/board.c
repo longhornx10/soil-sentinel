@@ -145,24 +145,20 @@ static esp_err_t read_channel_mv(adc_channel_t channel,
     for (size_t i = 3; i < SAMPLE_COUNT - 3; ++i) sum += values[i];
     const int raw = (int)(sum / (SAMPLE_COUNT - 6));
 
+    ESP_RETURN_ON_FALSE(cali, ESP_ERR_INVALID_STATE, TAG,
+                        "ADC calibration handle is unavailable");
     int mv = 0;
-    if (cali && adc_cali_raw_to_voltage(cali, raw, &mv) == ESP_OK) {
-        *value_mv = (float)mv;
-        if (noise_mv) {
-            int lo = 0, hi = 0;
-            if (adc_cali_raw_to_voltage(cali, values[3], &lo) == ESP_OK &&
-                adc_cali_raw_to_voltage(cali, values[SAMPLE_COUNT - 4], &hi) == ESP_OK) {
-                *noise_mv = (float)(hi - lo);
-            } else {
-                *noise_mv = 0.0f;
-            }
-        }
-        return ESP_OK;
-    }
-
-    *value_mv = raw * 3300.0f / 4095.0f;
+    ESP_RETURN_ON_ERROR(adc_cali_raw_to_voltage(cali, raw, &mv), TAG,
+                        "ADC calibrated conversion failed");
+    *value_mv = (float)mv;
     if (noise_mv) {
-        *noise_mv = (values[SAMPLE_COUNT - 4] - values[3]) * 3300.0f / 4095.0f;
+        int lo = 0, hi = 0;
+        ESP_RETURN_ON_ERROR(adc_cali_raw_to_voltage(cali, values[3], &lo), TAG,
+                            "ADC low-noise conversion failed");
+        ESP_RETURN_ON_ERROR(
+            adc_cali_raw_to_voltage(cali, values[SAMPLE_COUNT - 4], &hi), TAG,
+            "ADC high-noise conversion failed");
+        *noise_mv = (float)(hi - lo);
     }
     return ESP_OK;
 }
@@ -271,8 +267,12 @@ esp_err_t board_init(void)
     };
     adc_cali_curve_fitting_config_t battery_cali_cfg = soil_cali_cfg;
     battery_cali_cfg.chan = ADC_CHANNEL_0;
-    (void)adc_cali_create_scheme_curve_fitting(&soil_cali_cfg, &s_soil_cali);
-    (void)adc_cali_create_scheme_curve_fitting(&battery_cali_cfg, &s_battery_cali);
+    ESP_RETURN_ON_ERROR(
+        adc_cali_create_scheme_curve_fitting(&soil_cali_cfg, &s_soil_cali), TAG,
+        "soil ADC calibration init failed");
+    ESP_RETURN_ON_ERROR(
+        adc_cali_create_scheme_curve_fitting(&battery_cali_cfg, &s_battery_cali), TAG,
+        "battery ADC calibration init failed");
     return ESP_OK;
 }
 
@@ -335,7 +335,9 @@ void board_led_status(float moisture_pct, bool diagnostic_fault, bool manual)
     gpio_set_level(pin, 1);
     vTaskDelay(pdMS_TO_TICKS(MANUAL_LED_PULSE_MS));
     gpio_set_level(pin, 0);
-    if (diagnostic_fault) ESP_LOGW(TAG, "manual display completed with diagnostic fault");
+    if (diagnostic_fault) {
+        ESP_LOGW(TAG, "manual moisture band shown; sample also exceeded the diagnostic noise limit");
+    }
 }
 
 void board_indicator_ota_ready(void)

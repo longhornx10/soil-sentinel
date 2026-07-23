@@ -308,6 +308,118 @@ static void test_service_button_policy(void)
            SOIL_SERVICE_BUTTON_FACTORY_RESET);
 }
 
+
+static void test_battery_mode_hysteresis(void)
+{
+    soil_policy_t p = soil_policy_default();
+    soil_state_t s = {0};
+
+    soil_sample_t depleted = sample(2000.0f, 1050.0f, 5.0f);
+    soil_model_step(&p, &depleted, &s);
+    assert(s.mode == SOIL_MODE_SURVIVAL);
+
+    soil_sample_t survival_exit = sample(2000.0f, 1150.0f, 5.0f);
+    soil_model_step(&p, &survival_exit, &s);
+    assert(s.mode == SOIL_MODE_CONSERVATION);
+    assert((s.event_flags & SOIL_EVENT_BATTERY) != 0U);
+
+    soil_sample_t survival_wobble = sample(2000.0f, 1135.0f, 5.0f);
+    soil_model_step(&p, &survival_wobble, &s);
+    assert(s.mode == SOIL_MODE_CONSERVATION);
+    assert((s.event_flags & SOIL_EVENT_BATTERY) == 0U);
+
+    soil_sample_t conservation_exit = sample(2000.0f, 1215.0f, 5.0f);
+    soil_model_step(&p, &conservation_exit, &s);
+    assert(s.mode == SOIL_MODE_STABLE);
+    assert((s.event_flags & SOIL_EVENT_BATTERY) != 0U);
+
+    soil_sample_t conservation_wobble = sample(2000.0f, 1200.0f, 5.0f);
+    soil_model_step(&p, &conservation_wobble, &s);
+    assert(s.mode == SOIL_MODE_STABLE);
+    assert((s.event_flags & SOIL_EVENT_BATTERY) == 0U);
+
+    soil_sample_t conservation_enter = sample(2000.0f, 1195.0f, 5.0f);
+    soil_model_step(&p, &conservation_enter, &s);
+    assert(s.mode == SOIL_MODE_CONSERVATION);
+    assert((s.event_flags & SOIL_EVENT_BATTERY) != 0U);
+}
+
+static void test_confidence_formula_is_consistent(void)
+{
+    soil_policy_t p = soil_policy_default();
+    soil_state_t s = {0};
+    soil_sample_t first = sample(2000.0f, 1450.0f, 50.0f);
+    soil_model_step(&p, &first, &s);
+    assert(fabsf(s.confidence_pct - 60.0f) < 0.01f);
+
+    soil_sample_t second = sample(2000.0f, 1450.0f, 50.0f);
+    soil_model_step(&p, &second, &s);
+    assert(fabsf(s.confidence_pct - 60.0f) < 0.01f);
+}
+
+static void test_drying_rate_ema_and_mode(void)
+{
+    soil_policy_t p = soil_policy_default();
+    soil_state_t s = {0};
+    soil_sample_t first = sample(1800.0f, 1450.0f, 5.0f);
+    soil_model_step(&p, &first, &s);
+
+    soil_sample_t drying = sample(1900.0f, 1450.0f, 5.0f);
+    drying.elapsed_seconds = 3600U;
+    soil_model_step(&p, &drying, &s);
+
+    const float before = soil_calibrated_percent(1800.0f, 2750.0f, 1200.0f);
+    const float after = soil_calibrated_percent(1900.0f, 2750.0f, 1200.0f);
+    const float expected = 0.25f * (before - after);
+    assert(fabsf(s.drying_rate_pct_per_hour - expected) < 0.01f);
+    assert(s.mode == SOIL_MODE_DRYING);
+}
+
+static void test_hard_fault_still_emits_heartbeat(void)
+{
+    soil_policy_t p = soil_policy_default();
+    soil_state_t s = {0};
+    soil_sample_t first = sample(2000.0f, 1450.0f, 5.0f);
+    soil_model_step(&p, &first, &s);
+
+    soil_sample_t broken = sample(0.0f, 1450.0f, 5.0f);
+    broken.elapsed_seconds = p.heartbeat_seconds;
+    soil_model_step(&p, &broken, &s);
+    assert((s.event_flags & SOIL_EVENT_HEARTBEAT) != 0U);
+    assert(s.should_report);
+}
+
+static void test_watering_age_saturates(void)
+{
+    soil_policy_t p = soil_policy_default();
+    soil_state_t s = {0};
+    soil_sample_t first = sample(2000.0f, 1450.0f, 5.0f);
+    soil_model_step(&p, &first, &s);
+    s.has_watered = true;
+    s.seconds_since_watering = UINT32_MAX - 10U;
+
+    soil_sample_t next = sample(2000.0f, 1450.0f, 5.0f);
+    next.elapsed_seconds = 100U;
+    soil_model_step(&p, &next, &s);
+    assert(s.seconds_since_watering == UINT32_MAX);
+}
+
+static void test_noise_fault_keeps_finite_sample_valid(void)
+{
+    soil_policy_t p = soil_policy_default();
+    soil_state_t s = {0};
+    soil_sample_t first = sample(2000.0f, 1450.0f, 5.0f);
+    soil_model_step(&p, &first, &s);
+
+    soil_sample_t noisy = sample(2000.0f, 1450.0f,
+                                 p.noise_fault_mv + 1.0f);
+    soil_model_step(&p, &noisy, &s);
+    assert(s.sensor_fault);
+    assert(s.current_sample_valid);
+    assert(s.confidence_pct == 0.0f);
+    assert((s.event_flags & SOIL_EVENT_FAULT) != 0U);
+}
+
 int main(void)
 {
     test_calibration();
@@ -322,8 +434,14 @@ int main(void)
     test_use_current_as_bounds();
     test_watering_detection();
     test_low_battery_survival();
+    test_battery_mode_hysteresis();
     test_usb_without_battery_does_not_force_survival();
     test_hard_fault_preserves_last_valid_moisture();
+    test_hard_fault_still_emits_heartbeat();
+    test_confidence_formula_is_consistent();
+    test_drying_rate_ema_and_mode();
+    test_watering_age_saturates();
+    test_noise_fault_keeps_finite_sample_valid();
     test_telemetry_flags();
     puts("soil_model tests passed");
     return 0;

@@ -10,6 +10,10 @@
 #define SOIL_MIN_LEARNING_CYCLES 2U
 #define SOIL_WATERING_RAW_DROP_MV 120.0f
 #define SOIL_RELOCATION_JUMP_MV 1200.0f
+#define BATTERY_SURVIVAL_ENTER_PCT 8.0f
+#define BATTERY_SURVIVAL_EXIT_PCT 10.0f
+#define BATTERY_CONSERVATION_ENTER_PCT 20.0f
+#define BATTERY_CONSERVATION_EXIT_PCT 23.0f
 
 static float clampf(float value, float low, float high)
 {
@@ -39,14 +43,55 @@ static void policy_touch(soil_policy_t *policy)
                                   : policy->config_revision + 1U;
 }
 
-static void apply_battery_mode(soil_state_t *state)
+static bool battery_survival_active(float battery_pct, soil_mode_t previous_mode)
+{
+    return battery_pct <= BATTERY_SURVIVAL_ENTER_PCT ||
+           (previous_mode == SOIL_MODE_SURVIVAL &&
+            battery_pct < BATTERY_SURVIVAL_EXIT_PCT);
+}
+
+static bool battery_event_changed(bool previous_present,
+                                  float previous_pct,
+                                  float current_pct,
+                                  soil_mode_t previous_mode)
+{
+    if (!previous_present) return true;
+    if (previous_mode == SOIL_MODE_SURVIVAL) {
+        return current_pct >= BATTERY_SURVIVAL_EXIT_PCT;
+    }
+    if (current_pct <= BATTERY_SURVIVAL_ENTER_PCT &&
+        previous_pct > BATTERY_SURVIVAL_ENTER_PCT) {
+        return true;
+    }
+    if (previous_mode == SOIL_MODE_CONSERVATION) {
+        return current_pct >= BATTERY_CONSERVATION_EXIT_PCT;
+    }
+    return current_pct <= BATTERY_CONSERVATION_ENTER_PCT &&
+           previous_pct > BATTERY_CONSERVATION_ENTER_PCT;
+}
+
+static float measurement_confidence(float noise_mv, bool noise_fault)
+{
+    return noise_fault
+               ? 0.0f
+               : clampf(100.0f - noise_mv * 0.8f, 0.0f, 100.0f);
+}
+
+static void apply_battery_mode(soil_state_t *state, soil_mode_t previous_mode)
 {
     if (!state->battery_present) return;
 
-    if (state->battery_pct <= 8.0f) {
+    if (battery_survival_active(state->battery_pct, previous_mode)) {
         state->mode = SOIL_MODE_SURVIVAL;
         state->sample_interval_seconds = 12u * 60u * 60u;
-    } else if (state->battery_pct <= 20.0f && state->mode == SOIL_MODE_STABLE) {
+        return;
+    }
+
+    const bool conservation_active =
+        state->battery_pct <= BATTERY_CONSERVATION_ENTER_PCT ||
+        (previous_mode == SOIL_MODE_CONSERVATION &&
+         state->battery_pct < BATTERY_CONSERVATION_EXIT_PCT);
+    if (conservation_active && state->mode == SOIL_MODE_STABLE) {
         state->mode = SOIL_MODE_CONSERVATION;
         state->sample_interval_seconds = 12u * 60u * 60u;
     }
@@ -433,19 +478,20 @@ void soil_model_step(const soil_policy_t *policy,
     }
     state->sensor_fault = fault_now;
 
-    if (sample->battery_present) {
-        const bool battery_state_changed =
-            !previous_battery_present ||
-            (previous_battery_pct > 20.0f && state->battery_pct <= 20.0f) ||
-            (previous_battery_pct > 8.0f && state->battery_pct <= 8.0f);
-        if (battery_state_changed) state->event_flags |= SOIL_EVENT_BATTERY;
+    if (sample->battery_present &&
+        battery_event_changed(previous_battery_present,
+                              previous_battery_pct,
+                              state->battery_pct,
+                              previous_mode)) {
+        state->event_flags |= SOIL_EVENT_BATTERY;
     }
 
     if (hard_fault) {
         state->initialized = true;
         state->confidence_pct = 0.0f;
         state->mode =
-            sample->battery_present && state->battery_pct <= 8.0f
+            sample->battery_present &&
+                    battery_survival_active(state->battery_pct, previous_mode)
                 ? SOIL_MODE_SURVIVAL
                 : SOIL_MODE_CONSERVATION;
         state->sample_interval_seconds =
@@ -470,8 +516,7 @@ void soil_model_step(const soil_policy_t *policy,
         state->last_reported_pct = moisture;
         state->drying_rate_pct_per_hour = 0.0f;
         state->confidence_pct =
-            noise_fault ? 0.0f
-                        : clampf(100.0f - sample->noise_mv, 0.0f, 100.0f);
+            measurement_confidence(sample->noise_mv, noise_fault);
         state->mode =
             moisture <= policy->critical_threshold_pct
                 ? SOIL_MODE_CRITICAL
@@ -483,7 +528,7 @@ void soil_model_step(const soil_policy_t *policy,
                 : state->mode == SOIL_MODE_NEAR_DRY
                       ? policy->near_dry_sample_seconds
                       : policy->stable_sample_seconds;
-        apply_battery_mode(state);
+        apply_battery_mode(state, previous_mode);
         update_learning(policy, sample, state, stock_moisture, false);
         state->event_flags |= SOIL_EVENT_HEARTBEAT;
         if (sample->manual_sample) state->event_flags |= SOIL_EVENT_MANUAL;
@@ -508,9 +553,7 @@ void soil_model_step(const soil_policy_t *policy,
             0.25f * instantaneous_rate;
     }
     state->confidence_pct =
-        noise_fault
-            ? 0.0f
-            : clampf(100.0f - sample->noise_mv * 0.8f, 0.0f, 100.0f);
+        measurement_confidence(sample->noise_mv, noise_fault);
 
     if (watering_jump) {
         state->mode = SOIL_MODE_WATERING_CAPTURE;
@@ -546,7 +589,7 @@ void soil_model_step(const soil_policy_t *policy,
     update_learning(policy, sample, state, stock_moisture, watering_jump);
     soil_resolve_active_curve(policy, state);
     state->previous_raw_mv = sample->raw_mv;
-    apply_battery_mode(state);
+    apply_battery_mode(state, previous_mode);
 
     if (state->mode != previous_mode) state->event_flags |= SOIL_EVENT_MODE;
     if (fabsf(moisture - state->last_reported_pct) >=
