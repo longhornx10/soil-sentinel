@@ -16,6 +16,10 @@
 #include "esp_system.h"
 
 #define NORMAL_ZIGBEE_WAIT_MS 20000U
+#define MANUAL_ZIGBEE_WAIT_MS 30000U
+#define COLD_BOOT_ZIGBEE_WAIT_MS 45000U
+#define OTA_ZIGBEE_WAIT_MS 30000U
+#define VALIDATION_ZIGBEE_WAIT_MS 60000U
 #define COMMISSIONING_WINDOW_MS 120000U
 #define REPORT_RETRY_DELAY_MS 500U
 #define REPORT_SETTLE_MS 250U
@@ -26,7 +30,12 @@
 #define USB_BATTERY_RECHECK_MS 1000U
 #define CONFIG_DELIVERY_WINDOW_MS 5000U
 #define OTA_SERVICE_WINDOW_MS (15U * 60U * 1000U)
+#define OTA_NO_IMAGE_GRACE_MS 90000U
+#define OTA_QUERY_RETRY_MS 10000U
+#define OTA_PROGRESS_STALL_MS 90000U
+#define OTA_BATTERY_RECHECK_MS 5000U
 #define OTA_WAIT_INDICATOR_MS 30000U
+#define OTA_LOOP_DELAY_MS 250U
 #define BUTTON_OTA_HOLD_MS 3000U
 #define BUTTON_RESET_WARNING_MS 15000U
 #define BUTTON_FACTORY_RESET_MS 20000U
@@ -192,6 +201,17 @@ static esp_err_t service_queued_configuration(soil_policy_t *policy,
     return final_err;
 }
 
+static bool ota_cancel_requested(void)
+{
+    if (!board_button_pressed()) return false;
+    vTaskDelay(pdMS_TO_TICKS(USB_BUTTON_DEBOUNCE_MS));
+    if (!board_button_pressed()) return false;
+    while (board_button_pressed()) {
+        vTaskDelay(pdMS_TO_TICKS(USB_BUTTON_POLL_MS));
+    }
+    return true;
+}
+
 static void run_ota_service_window(soil_policy_t *policy,
                                    soil_state_t *state,
                                    board_measurement_t *measurement)
@@ -205,10 +225,39 @@ static void run_ota_service_window(soil_policy_t *policy,
 
     uint32_t elapsed_ms = 0U;
     uint32_t indicator_ms = 0U;
+    uint32_t query_retry_ms = 0U;
+    uint32_t offer_wait_ms = 0U;
+    uint32_t battery_recheck_ms = 0U;
+    uint32_t progress_stall_ms = 0U;
+    uint8_t last_progress = firmware_update_progress_percent();
+    bool transfer_started = false;
+
     while (elapsed_ms < OTA_SERVICE_WINDOW_MS) {
-        vTaskDelay(pdMS_TO_TICKS(250U));
-        elapsed_ms += 250U;
-        indicator_ms += 250U;
+        vTaskDelay(pdMS_TO_TICKS(OTA_LOOP_DELAY_MS));
+        elapsed_ms += OTA_LOOP_DELAY_MS;
+        indicator_ms += OTA_LOOP_DELAY_MS;
+        query_retry_ms += OTA_LOOP_DELAY_MS;
+        battery_recheck_ms += OTA_LOOP_DELAY_MS;
+
+        if (ota_cancel_requested()) {
+            ESP_LOGW(TAG, "OTA service window cancelled by button press");
+            firmware_update_timeout();
+            board_indicator_ota_failure();
+            return;
+        }
+
+        if (battery_recheck_ms >= OTA_BATTERY_RECHECK_MS && state->battery_present) {
+            float loaded_battery_mv = measurement->battery_mv;
+            battery_recheck_ms = 0U;
+            if (board_read_battery_mv(&loaded_battery_mv) != ESP_OK ||
+                loaded_battery_mv < SOIL_OTA_MIN_BATTERY_MV) {
+                measurement->battery_mv = loaded_battery_mv;
+                firmware_update_refuse_low_battery();
+                board_indicator_ota_low_battery();
+                return;
+            }
+            measurement->battery_mv = loaded_battery_mv;
+        }
 
         if (zigbee_transport_wait_config_change(0U)) {
             refresh_current_moisture(policy, state, measurement);
@@ -222,6 +271,51 @@ static void run_ota_service_window(soil_policy_t *policy,
             ota_state == SOIL_OTA_STATE_REFUSED) {
             return;
         }
+
+        if (ota_state == SOIL_OTA_STATE_DOWNLOADING ||
+            ota_state == SOIL_OTA_STATE_APPLYING) {
+            transfer_started = true;
+            offer_wait_ms = 0U;
+            const uint8_t progress = firmware_update_progress_percent();
+            if (progress != last_progress) {
+                last_progress = progress;
+                progress_stall_ms = 0U;
+            } else {
+                progress_stall_ms += OTA_LOOP_DELAY_MS;
+            }
+            if (progress_stall_ms >= OTA_PROGRESS_STALL_MS) {
+                ESP_LOGE(TAG, "OTA transfer stalled for %u ms", OTA_PROGRESS_STALL_MS);
+                firmware_update_timeout();
+                board_indicator_ota_failure();
+                return;
+            }
+        } else if (!transfer_started) {
+            offer_wait_ms += OTA_LOOP_DELAY_MS;
+            const bool no_image = ota_state == SOIL_OTA_STATE_IDLE &&
+                                  firmware_update_last_result() == SOIL_OTA_RESULT_NO_IMAGE;
+
+            if (offer_wait_ms >= OTA_NO_IMAGE_GRACE_MS) {
+                if (no_image) {
+                    ESP_LOGW(TAG, "no OTA image offered during the service grace period");
+                } else {
+                    ESP_LOGE(TAG, "OTA query did not start a transfer within the service grace period");
+                    firmware_update_timeout();
+                }
+                board_indicator_ota_failure();
+                return;
+            }
+
+            if ((ota_state == SOIL_OTA_STATE_QUERYING || no_image) &&
+                query_retry_ms >= OTA_QUERY_RETRY_MS) {
+                query_retry_ms = 0U;
+                if (zigbee_transport_begin_ota_query() != ESP_OK) {
+                    firmware_update_timeout();
+                    board_indicator_ota_failure();
+                    return;
+                }
+            }
+        }
+
         if (indicator_ms >= OTA_WAIT_INDICATOR_MS &&
             ota_state != SOIL_OTA_STATE_DOWNLOADING) {
             board_indicator_ota_waiting();
@@ -387,10 +481,18 @@ void app_main(void)
 
     if (need_zigbee) {
         ESP_ERROR_CHECK(zigbee_transport_start(&policy, &state, &diag, ota_mode));
-        const uint32_t wait_ms = (manual || usb_without_battery || ota_mode ||
-                                  validation_boot || cold_boot)
-                                     ? COMMISSIONING_WINDOW_MS
-                                     : NORMAL_ZIGBEE_WAIT_MS;
+        uint32_t wait_ms = NORMAL_ZIGBEE_WAIT_MS;
+        if (usb_without_battery) {
+            wait_ms = COMMISSIONING_WINDOW_MS;
+        } else if (validation_boot) {
+            wait_ms = VALIDATION_ZIGBEE_WAIT_MS;
+        } else if (ota_mode) {
+            wait_ms = OTA_ZIGBEE_WAIT_MS;
+        } else if (manual) {
+            wait_ms = MANUAL_ZIGBEE_WAIT_MS;
+        } else if (cold_boot) {
+            wait_ms = COLD_BOOT_ZIGBEE_WAIT_MS;
+        }
         zigbee_ready = zigbee_transport_wait_ready(wait_ms);
         if (zigbee_ready) {
             const bool paired_now = board_pairing_indicator_is_success();
@@ -423,9 +525,18 @@ void app_main(void)
                     measurement.battery_mv = loaded_battery_mv;
                     run_ota_service_window(&policy, &state, &measurement);
                 }
+                /* Report the final OTA result before sleeping. The old code only
+                 * published the pre-service state, which made a timeout look like
+                 * a dead device until its next scheduled wake. */
+                publish_err = publish_with_retry(&state, &measurement);
+                vTaskDelay(pdMS_TO_TICKS(REPORT_SETTLE_MS));
             }
         } else {
             publish_err = ESP_ERR_TIMEOUT;
+            if (ota_mode) {
+                firmware_update_timeout();
+                board_indicator_ota_failure();
+            }
             if (!usb_without_battery && state.sample_interval_seconds < 3600U) {
                 state.sample_interval_seconds = 3600U;
             }

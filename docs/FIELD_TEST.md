@@ -1,6 +1,6 @@
 # First-board field validation
 
-Do not flash all four sensors until one unit completes this checklist.
+Do not flash all sensors until one unit completes this checklist.
 
 ## 1. Build gate
 
@@ -31,11 +31,13 @@ idf.py -p /dev/ttyACM0 erase-flash flash monitor
 
 This migration erases the old Zigbee pairing because the dual-slot partition table relocates Zigbee storage. Pair the test unit again in ZHA.
 
+Sensors already using the dual-slot 1.0 layout must **not** be erased for 1.0.1; use normal serial flashing or Zigbee OTA so pairing and calibration survive.
+
 ## 3. Basic behavior
 
 Verify:
 
-- existing pin map and external antenna selection
+- existing pin map and external antenna selection while awake
 - short press takes a new sample
 - dry/mid/moist displays red/yellow/green
 - invalid electrical sample flashes red three times
@@ -44,7 +46,19 @@ Verify:
 - native moisture, battery percentage, and battery voltage arrive in ZHA
 - all schema-v2 diagnostic values decode correctly
 
-## 4. Queued Home Assistant configuration
+## 4. Deep-sleep power state
+
+Measure GPIO and current after the device enters deep sleep:
+
+- GPIO3 is high, disabling the XIAO RF switch
+- GPIO14 is low, preventing antenna-select back-feed while the switch is disabled
+- probe excitation and all LEDs are low
+- button wake still works with the new held GPIO levels
+- integrated deep-sleep current is materially lower than the 1.0.0 build
+
+Repeat after a timer wake, button wake, failed report, and OTA exit. A power fix that only works after the first boot is merely a bug with excellent timing.
+
+## 5. Queued Home Assistant configuration
 
 While the device sleeps:
 
@@ -58,7 +72,7 @@ While the device sleeps:
 
 Test every action: current-as-dry, current-as-wet, copy learned, reset learned, restore stock, plant moved, and identify.
 
-## 5. Learning simulation on hardware
+## 6. Learning simulation on hardware
 
 Capture raw voltage and noise in:
 
@@ -71,31 +85,47 @@ Capture raw voltage and noise in:
 
 Run at least two realistic dry/water cycles. Confirm the learned curve remains inactive until confidence gates pass, does not map a narrow range to 0-100%, and can be disabled instantly by selecting Stock.
 
-## 6. OTA success test
+## 7. OTA success test
 
 1. Build a second image with a strictly higher Zigbee file version.
 2. Install its `.ota` and `index.json` in Home Assistant.
 3. Hold the sensor button for three seconds; confirm red-yellow-green.
-4. Release and start Install from the Update entity.
-5. Verify progress, reboot into the other slot, first-boot health report, validation, and immediate success diagnostics.
-6. Confirm pairing, settings, manual bounds, and learned state survive.
+4. Release and start Install from the Update entity within 90 seconds.
+5. Verify Query Next Image retries if the first response is No Image.
+6. Verify progress, reboot into the other slot, first-boot health report, validation, and immediate success diagnostics.
+7. Confirm pairing, settings, manual bounds, and learned state survive.
 
-## 7. Intentional rollback test
+## 8. OTA recovery and bounded-awake tests
 
-Use a dedicated test build that deliberately withholds first-boot validation. Confirm the bootloader returns to the prior slot and reports Rolled back. Never deploy that test image to the other three units. Humans have already invented enough accidental rollback tests.
+Run each case with serial logging and current measurement:
 
-## 8. Low-battery OTA refusal
+- **No image:** arm OTA without an available image; verify repeated queries and deep sleep within roughly 90 seconds after Zigbee is ready.
+- **Coordinator absent:** disable the coordinator; verify OTA readiness wait ends in about 30 seconds and the board sleeps.
+- **Button cancel:** arm OTA, then short-press; verify the active transfer is aborted if necessary and the board sleeps immediately after reporting failure.
+- **Interrupted transfer:** remove the OTA provider or interrupt delivery mid-image; verify a 90-second no-progress timeout, partition abort, and return to sleep.
+- **Battery sag:** use a current-limited bench supply or characterized cell; verify the five-second loaded-voltage checks abort below threshold.
+- **Power removal:** remove and restore the AA during waiting and download; verify OTA mode is not restored from persistent state and normal boot resumes.
+- **Maximum window:** prevent completion while still making occasional progress; verify the absolute 15-minute deadline wins.
+
+Record awake duration and integrated charge for every case. None may leave the board indefinitely awake or require reflashing to recover.
+
+## 9. Intentional rollback test
+
+Use a dedicated test build that deliberately withholds first-boot validation. Confirm the bootloader returns to the prior slot and reports Rolled back. Never deploy that test image to the other units. Humans have already invented enough accidental rollback tests.
+
+## 10. Low-battery OTA refusal
 
 Using a current-limited bench supply or characterized alkaline cell, verify:
 
 - pre-radio refusal below threshold
 - active-radio voltage check catches load sag
+- periodic OTA voltage checks catch later sag
 - three red flashes and no partition write
 - ordinary measurement still works afterward
 
 Tune `SOIL_OTA_MIN_BATTERY_MV` from measured behavior.
 
-## 9. Power budget
+## 11. Power budget
 
 Measure integrated charge for:
 
@@ -106,7 +136,8 @@ Measure integrated charge for:
 - join/rejoin
 - button sample
 - watering capture
-- 15-minute OTA waiting window
+- no-image OTA grace period
 - full OTA transfer
+- cancelled and stalled OTA transfer
 
-Confirm no Wi-Fi tasks or activity exist and no GPIO leaks defeat deep sleep. Record the result in issues #2, #3, and #5 before declaring the remaining sensors field-ready.
+Confirm no Wi-Fi tasks or activity exist and no GPIO leaks defeat deep sleep. Record the result before declaring the remaining sensors field-ready.

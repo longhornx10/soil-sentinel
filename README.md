@@ -2,13 +2,14 @@
 
 Native ESP-IDF firmware for the Seeed Studio XIAO ESP32-C6 Soil Moisture Sensor. It provides native Zigbee reporting, three moisture-calibration modes, queued Home Assistant controls, manually armed Zigbee OTA updates, and aggressive deep-sleep power management for one alkaline AA cell.
 
-## Field-ready 1.0 bundle
+## Field-ready 1.0.1 bundle
 
 - ESP-IDF 5.5.4 and ESP Zigbee SDK 2.x sleepy-end-device firmware
 - No Wi-Fi initialization or Wi-Fi runtime
 - Dual OTA application slots with ESP-IDF rollback
-- Zigbee OTA is available only during a manually armed 15-minute service window
-- OTA entry requires a three-second button hold and a battery check before and after Zigbee starts
+- Zigbee OTA is available only after a deliberate three-second button hold
+- OTA waits up to 90 seconds for an image offer, then allows a transfer for up to 15 minutes
+- OTA can be cancelled with a button press and aborts on battery sag or stalled progress
 - Stock, learning, and manual moisture calibration modes
 - Controller-side queuing of Home Assistant settings until the sensor next wakes
 - Atomic, revisioned configuration with last-known-good fallback
@@ -23,17 +24,19 @@ Native ESP-IDF firmware for the Seeed Studio XIAO ESP32-C6 Soil Moisture Sensor.
 | Gesture | Behavior |
 |---|---|
 | Short press | Take a fresh measurement, show the moisture color, and report it |
-| Hold for 3 seconds, then release | Arm Zigbee OTA mode for 15 minutes |
+| Hold for 3 seconds, then release | Arm Zigbee OTA mode |
+| Short press during OTA | Cancel OTA and return to normal sleep |
 | Continue holding to 15 seconds | Flash a reset warning; releasing cancels reset and enters OTA mode |
 | Continue holding to 20 seconds | Full factory reset, including Zigbee pairing |
 
 OTA entry indications:
 
 - Red, yellow, green: OTA service mode is accepted. Release the button.
-- Three red flashes: the alkaline AA voltage is below the provisional OTA-safe threshold.
+- Three red flashes: battery is unsafe, no image was offered, the transfer stalled, the window expired, or OTA was cancelled.
 - Brief yellow blink: waiting for Home Assistant or download progress.
 - Three green flashes: image received and selected for reboot.
-- Three red flashes: OTA failed or the service window expired.
+
+The device retries Query Next Image while waiting, but it no longer sits awake for the full transfer window when Home Assistant has nothing to offer. If no transfer begins within 90 seconds, it reports the final OTA result and returns to deep sleep.
 
 The OTA battery threshold is deliberately conservative but remains a hardware-validation item. Final voltage limits must be based on a real alkaline cell measured while Zigbee is active, because batteries enjoy changing the answer when current is actually drawn.
 
@@ -55,7 +58,7 @@ Home Assistant also exposes actions to use the current reading as dry or wet, co
 
 ## Power policy
 
-The probe excitation, LEDs, and Zigbee radio remain off between measurements. Wi-Fi is never initialized. GPIO output levels are held through deep sleep.
+The probe excitation and LEDs remain off between measurements. Wi-Fi is never initialized. Before deep sleep, the firmware disables the XIAO RF switch on GPIO3 and pulls the antenna-select line low; both levels are held until the next wake. Normal battery wakes also use shorter bounded Zigbee readiness waits instead of the two-minute commissioning window reserved for USB pairing.
 
 | State | Default interval |
 |---|---:|
@@ -72,7 +75,7 @@ Reports are event-driven. Threshold crossings, watering, operating-mode changes,
 
 ## One-time migration warning
 
-This release changes the flash map from one factory application partition to two OTA slots. The old Zigbee storage partition sits inside the new first OTA application slot, so the one-time migration **cannot preserve the existing pairing**. Each already-flashed sensor must be erased, flashed, and paired once more.
+The 1.0 release changed the flash map from one factory application partition to two OTA slots. The old Zigbee storage partition sits inside the new first OTA application slot, so that one-time migration **cannot preserve the existing pairing**. Each sensor still running the pre-1.0 layout must be erased, flashed, and paired once more.
 
 After that migration, ordinary OTA updates preserve Zigbee pairing, settings, manual calibration, and learned calibration.
 
@@ -97,7 +100,7 @@ source ~/esp/esp-idf/export.sh
 Outputs:
 
 - `build/soil_sentinel.bin`: raw ESP-IDF application image
-- `dist/soil-sentinel-1.0.0.ota`: Zigbee OTA container
+- `dist/soil-sentinel-1.0.1.ota`: Zigbee OTA container
 - `dist/index.json`: local zigpy OTA index
 - `dist/SHA256SUMS`: release checksums
 
@@ -118,8 +121,8 @@ See:
 | Battery ADC | 0 | ADC1 input |
 | Soil ADC | 1 | ADC1 input |
 | Button / deep-sleep wake | 2 | Active low with pull-up |
-| RF switch control enable | 3 | Driven low and held during sleep |
-| External antenna select | 14 | Driven high and held during sleep |
+| RF switch control enable | 3 | Low while awake; driven high and held during sleep |
+| External antenna select | 14 | High while awake; driven low and held during sleep |
 | Yellow LED | 18 | Active high; held low during sleep |
 | Green LED | 19 | Active high; held low during sleep |
 | Red LED | 20 | Active high; held low during sleep |
@@ -152,4 +155,4 @@ The host logic suite currently covers:
 - alkaline low-battery behavior
 - OTA/refusal/factory-reset button policy
 
-An ESP-IDF build and physical-board validation are still mandatory before flashing all four units. Zigbee SDK APIs, partition sizes, ADC behavior, current draw, RF reliability, and rollback cannot be honestly certified by a desktop C compiler, despite the software industry’s recurring efforts to manifest hardware through confidence.
+The 1.0.1 OTA recovery and RF-switch power changes require the physical checks in `docs/FIELD_TEST.md`. An ESP-IDF build and physical-board validation remain mandatory because Zigbee SDK APIs, ADC behavior, current draw, RF reliability, and rollback cannot be honestly certified by a desktop C compiler, despite the software industry’s recurring efforts to manifest hardware through confidence.

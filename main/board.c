@@ -27,7 +27,9 @@ static const char *TAG = "board";
 #define PIN_LED_RED          GPIO_NUM_20
 
 #define RF_SWITCH_CONTROL_ENABLE_LEVEL 0
+#define RF_SWITCH_CONTROL_DISABLE_LEVEL 1
 #define RF_EXTERNAL_ANTENNA_LEVEL      1
+#define RF_INTERNAL_ANTENNA_LEVEL      0
 #define MANUAL_LED_PULSE_MS             300U
 #define SHORT_BLINK_MS                  110U
 #define STATUS_GAP_MS                   90U
@@ -298,8 +300,12 @@ void board_prepare_sleep(void)
 {
     (void)set_probe_duty(0);
     set_leds(false, false, false);
-    (void)gpio_set_level(PIN_RF_SWITCH_ENABLE, RF_SWITCH_CONTROL_ENABLE_LEVEL);
-    (void)gpio_set_level(PIN_RF_ANT_SELECT, RF_EXTERNAL_ANTENNA_LEVEL);
+    /* GPIO3 low powers/enables the XIAO RF switch. Disable it during deep
+     * sleep and pull the select line low so the unpowered switch cannot be
+     * back-fed through GPIO14. board_init() restores the external antenna
+     * before Zigbee starts on the next wake. */
+    (void)gpio_set_level(PIN_RF_ANT_SELECT, RF_INTERNAL_ANTENNA_LEVEL);
+    (void)gpio_set_level(PIN_RF_SWITCH_ENABLE, RF_SWITCH_CONTROL_DISABLE_LEVEL);
     hold_sleep_outputs();
 }
 
