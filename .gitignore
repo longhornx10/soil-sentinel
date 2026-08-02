@@ -2,6 +2,8 @@
 /dist/
 /sdkconfig
 /sdkconfig.old
+/sdkconfig.*
+!/sdkconfig.defaults
 /dependencies.lock
 managed_components/
 __pycache__/

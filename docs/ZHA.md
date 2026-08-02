@@ -57,7 +57,7 @@ The firmware applies a configuration only when it receives the final desired rev
 
 A short physical button press forces a measurement/report window and is the fastest way to deliver queued settings.
 
-One-shot actions are best pressed immediately after waking the device. Persistent settings survive Home Assistant restarts through ZHA’s attribute cache and revision comparison; one-shot actions are deliberately not replayed indefinitely, since repeatedly declaring that a plant moved would eventually become performance art.
+One-shot actions are best pressed immediately after waking the device. Persistent settings survive Home Assistant restarts through ZHA’s attribute cache and revision comparison; one-shot actions are retried on each telemetry report until the sensor is awake and the write is accepted, so even a click made while the flowerpot is napping eventually lands.
 
 ## Calibration workflow
 

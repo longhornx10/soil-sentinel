@@ -4,7 +4,13 @@ set -euo pipefail
 ./scripts/build.sh
 python3 ./scripts/build-zigbee-ota.py \
   build/soil_sentinel.bin \
-  --output-dir dist \
-  --version-name 1.0.1 \
-  --file-version 0x00010001
-sha256sum build/soil_sentinel.bin dist/soil-sentinel-1.0.1.ota > dist/SHA256SUMS
+  --output-dir dist
+if command -v sha256sum >/dev/null 2>&1; then
+  SHA256="sha256sum"
+elif command -v shasum >/dev/null 2>&1; then
+  SHA256="shasum -a 256"
+else
+  echo "error: no sha256sum or shasum found" >&2
+  exit 1
+fi
+$SHA256 build/soil_sentinel.bin dist/soil-sentinel-*.ota > dist/SHA256SUMS

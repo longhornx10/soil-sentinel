@@ -41,6 +41,9 @@ typedef enum {
     SOIL_CONFIG_REJECT_NO_SAMPLE,
     SOIL_CONFIG_REJECT_NO_LEARNED_CURVE,
     SOIL_CONFIG_REJECT_PERSISTENCE,
+    SOIL_CONFIG_REJECT_STALE_REVISION,
+    SOIL_CONFIG_REJECT_INVALID_ARG,
+    SOIL_CONFIG_REJECT_POLICY,
 } soil_config_result_t;
 
 typedef enum {
@@ -96,6 +99,8 @@ typedef struct {
     bool battery_present;
 } soil_sample_t;
 
+/* soil_state_t is persisted by value (RTC + NVS) and must be zero-initialized
+   before first use (memset(0) or `= {0}`). Do not change its layout. */
 typedef struct {
     bool initialized;
     bool has_valid_moisture;

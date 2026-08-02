@@ -147,12 +147,22 @@ static void test_copy_learning_to_manual_and_reset(void)
     assert(p.manual_dry_raw_mv == 2600.0f);
     assert(p.manual_wet_raw_mv == 1350.0f);
 
+    const uint32_t revision = p.config_revision;
     assert(soil_apply_control_action(
                &p, &s, SOIL_ACTION_RESET_LEARNING, NAN) ==
            SOIL_CONFIG_OK);
     assert(s.learning_cycle_count == 0U);
     assert(s.learned_dry_raw_mv == 0.0f);
     assert(p.manual_dry_raw_mv == 2600.0f);
+    /* RESET_LEARNING only clears learning state; it must not bump the
+       config revision (that would silently stale persisted configs). */
+    assert(p.config_revision == revision);
+
+    assert(soil_apply_control_action(
+               &p, &s, SOIL_ACTION_PLANT_MOVED, NAN) ==
+           SOIL_CONFIG_OK);
+    assert(s.learning_cycle_count == 0U);
+    assert(p.config_revision == revision);
 }
 
 static void test_use_current_as_bounds(void)
@@ -265,7 +275,12 @@ static void test_atomic_revisioned_configuration(void)
     assert(soil_policy_apply_configuration(
                &p, SOIL_CALIBRATION_MANUAL, 1300.0f, 1400.0f,
                30.0f, 15.0f, 2U) == SOIL_CONFIG_REJECT_SPAN);
-    assert(memcmp(&p, &original, sizeof(p)) == 0);
+    assert(p.config_revision == original.config_revision);
+    assert(p.calibration_mode == original.calibration_mode);
+    assert(p.manual_dry_raw_mv == original.manual_dry_raw_mv);
+    assert(p.manual_wet_raw_mv == original.manual_wet_raw_mv);
+    assert(p.dry_threshold_pct == original.dry_threshold_pct);
+    assert(p.critical_threshold_pct == original.critical_threshold_pct);
 
     assert(soil_policy_apply_configuration(
                &p, SOIL_CALIBRATION_MANUAL, 2600.0f, 1400.0f,
@@ -278,8 +293,232 @@ static void test_atomic_revisioned_configuration(void)
     const soil_policy_t applied = p;
     assert(soil_policy_apply_configuration(
                &p, SOIL_CALIBRATION_STOCK, 2750.0f, 1200.0f,
-               28.0f, 16.0f, 1U) == SOIL_CONFIG_OK);
-    assert(memcmp(&p, &applied, sizeof(p)) == 0);
+               28.0f, 16.0f, 1U) == SOIL_CONFIG_REJECT_STALE_REVISION);
+    assert(p.config_revision == applied.config_revision);
+    assert(p.calibration_mode == applied.calibration_mode);
+    assert(p.manual_dry_raw_mv == applied.manual_dry_raw_mv);
+    assert(p.manual_wet_raw_mv == applied.manual_wet_raw_mv);
+    assert(p.dry_threshold_pct == applied.dry_threshold_pct);
+    assert(p.critical_threshold_pct == applied.critical_threshold_pct);
+}
+
+static void test_stale_revision_rejected(void)
+{
+    soil_policy_t p = soil_policy_default();
+    const soil_policy_t before = p;
+
+    assert(soil_policy_apply_configuration(
+               &p, SOIL_CALIBRATION_MANUAL, 2600.0f, 1400.0f,
+               30.0f, 15.0f, 1U) == SOIL_CONFIG_REJECT_STALE_REVISION);
+    assert(p.config_revision == before.config_revision);
+    assert(p.calibration_mode == before.calibration_mode);
+    assert(p.manual_dry_raw_mv == before.manual_dry_raw_mv);
+    assert(p.manual_wet_raw_mv == before.manual_wet_raw_mv);
+    assert(p.dry_threshold_pct == before.dry_threshold_pct);
+    assert(p.critical_threshold_pct == before.critical_threshold_pct);
+}
+
+static void test_policy_validate_rejects_policy_fields(void)
+{
+    soil_policy_t p = soil_policy_default();
+    soil_config_result_t result = SOIL_CONFIG_OK;
+
+    assert(soil_policy_validate(&p, &result));
+    assert(result == SOIL_CONFIG_OK);
+
+    p.report_delta_pct = NAN;
+    assert(!soil_policy_validate(&p, &result));
+    assert(result == SOIL_CONFIG_REJECT_POLICY);
+    p.report_delta_pct = 3.0f;
+
+    p.watering_delta_pct = 0.0f;
+    assert(!soil_policy_validate(&p, &result));
+    assert(result == SOIL_CONFIG_REJECT_POLICY);
+    p.watering_delta_pct = 8.0f;
+
+    p.noise_fault_mv = NAN;
+    assert(!soil_policy_validate(&p, &result));
+    assert(result == SOIL_CONFIG_REJECT_POLICY);
+    p.noise_fault_mv = 90.0f;
+
+    p.heartbeat_seconds = 0U;
+    assert(!soil_policy_validate(&p, &result));
+    assert(result == SOIL_CONFIG_REJECT_POLICY);
+    p.heartbeat_seconds = 24u * 60u * 60u;
+
+    assert(soil_policy_validate(&p, &result));
+    assert(result == SOIL_CONFIG_OK);
+}
+
+static void test_noop_actions_do_not_touch_state(void)
+{
+    soil_policy_t p = soil_policy_default();
+    soil_state_t s = {
+        .event_flags = 0x1234U,
+        .should_report = true,
+        .applied_config_revision = 42U,
+        .last_config_result = SOIL_CONFIG_REJECT_SPAN,
+    };
+
+    assert(soil_apply_control_action(&p, &s, SOIL_ACTION_NONE, NAN) ==
+           SOIL_CONFIG_OK);
+    assert(s.event_flags == 0x1234U);
+    assert(s.should_report);
+    assert(s.applied_config_revision == 42U);
+    assert(s.last_config_result == SOIL_CONFIG_REJECT_SPAN);
+
+    assert(soil_apply_control_action(&p, &s, SOIL_ACTION_IDENTIFY, NAN) ==
+           SOIL_CONFIG_OK);
+    assert(s.event_flags == 0x1234U);
+    assert(s.should_report);
+    assert(s.applied_config_revision == 42U);
+    assert(s.last_config_result == SOIL_CONFIG_REJECT_SPAN);
+}
+
+static void test_config_action_syncs_last_reported_pct(void)
+{
+    soil_policy_t p = soil_policy_default();
+    soil_state_t s = {0};
+    soil_sample_t first = sample(2000.0f, 1450.0f, 5.0f);
+    soil_model_step(&p, &first, &s);
+    assert(s.has_valid_moisture);
+
+    s.last_reported_pct = 0.0f;
+    assert(soil_apply_control_action(
+               &p, &s, SOIL_ACTION_USE_CURRENT_AS_DRY, 2600.0f) ==
+           SOIL_CONFIG_OK);
+    /* The config report itself must not trigger a spurious delta report. */
+    assert(s.last_reported_pct == s.moisture_pct);
+}
+
+static void test_watering_jump_clamps_drying_rate(void)
+{
+    soil_policy_t p = soil_policy_default();
+    soil_state_t s = {0};
+    soil_sample_t first = sample(2300.0f, 1450.0f, 5.0f);
+    soil_model_step(&p, &first, &s);
+
+    soil_sample_t watered = sample(1800.0f, 1450.0f, 5.0f);
+    watered.elapsed_seconds = 900U;
+    soil_model_step(&p, &watered, &s);
+    assert((s.event_flags & SOIL_EVENT_WATERING) != 0U);
+    assert(s.mode == SOIL_MODE_WATERING_CAPTURE);
+    /* The watering jump must be clamped to 0, not drag the EMA negative. */
+    assert(s.drying_rate_pct_per_hour >= 0.0f);
+}
+
+static void test_recently_watered_critical_takes_priority(void)
+{
+    soil_policy_t p = soil_policy_default();
+    soil_state_t s = {0};
+
+    soil_sample_t dry = sample(2650.0f, 1450.0f, 5.0f);
+    soil_model_step(&p, &dry, &s);
+    assert(s.mode == SOIL_MODE_CRITICAL);
+
+    soil_sample_t watered = sample(2500.0f, 1450.0f, 5.0f);
+    watered.elapsed_seconds = 60U;
+    soil_model_step(&p, &watered, &s);
+    assert(s.mode == SOIL_MODE_WATERING_CAPTURE);
+    assert((s.event_flags & SOIL_EVENT_WATERING) != 0U);
+
+    /* Critical reading within the 1 h watering window: threshold check must
+       run before recently-watered retention. */
+    soil_sample_t still_critical = sample(2550.0f, 1450.0f, 5.0f);
+    still_critical.elapsed_seconds = 60U;
+    soil_model_step(&p, &still_critical, &s);
+    assert(s.mode == SOIL_MODE_CRITICAL);
+    assert((s.event_flags & SOIL_EVENT_THRESHOLD) != 0U);
+}
+
+static void test_exact_boundaries(void)
+{
+    soil_policy_t p = soil_policy_default();
+    soil_state_t s = {0};
+
+    /* 2316 mV calibrates to exactly 28.0 % == dry_threshold_pct. */
+    soil_sample_t boundary = sample(2316.0f, 1450.0f, 5.0f);
+    soil_model_step(&p, &boundary, &s);
+    assert(s.mode == SOIL_MODE_NEAR_DRY);
+
+    /* 2269.5 mV calibrates to exactly 31.0 %, a delta of exactly 3.0 pct. */
+    soil_sample_t delta_report = sample(2269.5f, 1450.0f, 5.0f);
+    delta_report.elapsed_seconds = 3600U;
+    soil_model_step(&p, &delta_report, &s);
+    assert((s.event_flags & SOIL_EVENT_THRESHOLD) != 0U);
+}
+
+static void test_battery_glitch_does_not_force_survival(void)
+{
+    soil_policy_t p = soil_policy_default();
+    soil_state_t s = {0};
+    soil_sample_t first = sample(2000.0f, 1450.0f, 5.0f);
+    soil_model_step(&p, &first, &s);
+    const float previous_pct = s.battery_pct;
+    assert(s.mode == SOIL_MODE_STABLE);
+
+    soil_sample_t glitch = sample(2000.0f, NAN, 5.0f);
+    soil_model_step(&p, &glitch, &s);
+    assert(s.battery_pct == previous_pct);
+    assert(s.mode != SOIL_MODE_SURVIVAL);
+    assert((s.event_flags & SOIL_EVENT_BATTERY) == 0U);
+
+    soil_sample_t dead = sample(2000.0f, 0.0f, 5.0f);
+    soil_model_step(&p, &dead, &s);
+    assert(s.battery_pct == previous_pct);
+    assert(s.mode != SOIL_MODE_SURVIVAL);
+    assert((s.event_flags & SOIL_EVENT_BATTERY) == 0U);
+}
+
+static void test_battery_glitch_preserves_survival(void)
+{
+    soil_policy_t p = soil_policy_default();
+    soil_state_t s = {0};
+    soil_sample_t depleted = sample(2000.0f, 1050.0f, 5.0f);
+    soil_model_step(&p, &depleted, &s);
+    assert(s.mode == SOIL_MODE_SURVIVAL);
+    assert(s.sample_interval_seconds == 12u * 60u * 60u);
+
+    /* A glitched reading must not bounce a nearly-dead device back to fast
+       soil sampling: SURVIVAL is preserved until a valid reading says exit. */
+    soil_sample_t glitch = sample(2000.0f, NAN, 5.0f);
+    soil_model_step(&p, &glitch, &s);
+    assert(s.mode == SOIL_MODE_SURVIVAL);
+    assert(s.sample_interval_seconds == 12u * 60u * 60u);
+
+    soil_sample_t dead = sample(2000.0f, 0.0f, 5.0f);
+    soil_model_step(&p, &dead, &s);
+    assert(s.mode == SOIL_MODE_SURVIVAL);
+    assert(s.sample_interval_seconds == 12u * 60u * 60u);
+
+    /* A valid, recovered reading exits survival normally. */
+    soil_sample_t recovered = sample(2000.0f, 1150.0f, 5.0f);
+    soil_model_step(&p, &recovered, &s);
+    assert(s.mode == SOIL_MODE_CONSERVATION);
+}
+
+static void test_battery_removal_fires_event(void)
+{
+    soil_policy_t p = soil_policy_default();
+    soil_state_t s = {0};
+    soil_sample_t first = sample(2000.0f, 1450.0f, 5.0f);
+    soil_model_step(&p, &first, &s);
+    assert(s.battery_present);
+
+    soil_sample_t removed = sample(2000.0f, 0.0f, 5.0f);
+    removed.battery_present = false;
+    soil_model_step(&p, &removed, &s);
+    assert(!s.battery_present);
+    assert((s.event_flags & SOIL_EVENT_BATTERY) != 0U);
+}
+
+static void test_utility_edge_cases(void)
+{
+    assert(soil_telemetry_flags(NULL) == 0U);
+    assert(soil_battery_percent(NAN) == 0.0f);
+    assert(soil_battery_percent(900.0f) == 0.0f);
+    assert(soil_battery_percent(1600.0f) == 100.0f);
+    assert(isnan(soil_calibrated_percent(NAN, 2750.0f, 1200.0f)));
 }
 
 static void test_service_button_policy(void)
@@ -427,14 +666,24 @@ int main(void)
     test_three_modes();
     test_invalid_manual_curve_is_atomic();
     test_atomic_revisioned_configuration();
+    test_stale_revision_rejected();
+    test_policy_validate_rejects_policy_fields();
     test_service_button_policy();
     test_threshold_validation();
     test_learning_converges_and_can_be_disabled();
     test_copy_learning_to_manual_and_reset();
     test_use_current_as_bounds();
+    test_noop_actions_do_not_touch_state();
+    test_config_action_syncs_last_reported_pct();
     test_watering_detection();
+    test_watering_jump_clamps_drying_rate();
+    test_recently_watered_critical_takes_priority();
+    test_exact_boundaries();
     test_low_battery_survival();
     test_battery_mode_hysteresis();
+    test_battery_glitch_does_not_force_survival();
+    test_battery_glitch_preserves_survival();
+    test_battery_removal_fires_event();
     test_usb_without_battery_does_not_force_survival();
     test_hard_fault_preserves_last_valid_moisture();
     test_hard_fault_still_emits_heartbeat();
@@ -443,6 +692,7 @@ int main(void)
     test_watering_age_saturates();
     test_noise_fault_keeps_finite_sample_valid();
     test_telemetry_flags();
+    test_utility_edge_cases();
     puts("soil_model tests passed");
     return 0;
 }

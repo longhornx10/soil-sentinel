@@ -12,6 +12,7 @@
 #include "esp_log.h"
 #include "esp_rom_sys.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
 #include "freertos/task.h"
 
 static const char *TAG = "board";
@@ -41,8 +42,6 @@ static const char *TAG = "board";
 #define PROBE_PWM_DUTY                   87U
 #define LED_DRY_MAX_PCT                 20.0f
 #define LED_MOIST_MAX_PCT               60.0f
-#define BUTTON_POLL_MS                  20U
-#define BUTTON_DEBOUNCE_MS              30U
 
 typedef enum {
     PAIRING_LED_OFF = 0,
@@ -64,7 +63,7 @@ static adc_oneshot_unit_handle_t s_adc;
 static adc_cali_handle_t s_soil_cali;
 static adc_cali_handle_t s_battery_cali;
 static volatile pairing_led_state_t s_pairing_led_state = PAIRING_LED_OFF;
-static TaskHandle_t s_pairing_blink_task;
+static volatile TaskHandle_t s_pairing_blink_task;
 
 static void release_sleep_output_holds(void)
 {
@@ -111,18 +110,27 @@ static esp_err_t set_probe_duty(uint32_t duty)
     return ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
 }
 
+/*
+ * The pairing blink task is created once and never deletes itself. The
+ * indicator functions can be called from several task contexts (app_main and
+ * the Zigbee mainloop), so a self-deleting task would let a check-then-notify
+ * sequence land on a freed TCB: with a persistent task the handle can never go
+ * stale and the race disappears.
+ */
 static void pairing_blink_task(void *arg)
 {
     (void)arg;
     bool red_on = false;
-    while (s_pairing_led_state == PAIRING_LED_SEARCHING) {
-        red_on = !red_on;
-        set_leds(red_on, false, false);
-        (void)ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(PAIRING_BLINK_INTERVAL_MS));
+    for (;;) {
+        if (s_pairing_led_state == PAIRING_LED_SEARCHING) {
+            red_on = !red_on;
+            set_leds(red_on, false, false);
+            (void)ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(PAIRING_BLINK_INTERVAL_MS));
+        } else {
+            gpio_set_level(PIN_LED_RED, 0);
+            (void)ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        }
     }
-    gpio_set_level(PIN_LED_RED, 0);
-    s_pairing_blink_task = NULL;
-    vTaskDelete(NULL);
 }
 
 static int compare_int(const void *a, const void *b)
@@ -314,19 +322,6 @@ bool board_button_pressed(void)
     return gpio_get_level(PIN_BUTTON) == 0;
 }
 
-uint32_t board_measure_button_hold_ms(uint32_t maximum_ms)
-{
-    if (!board_button_pressed()) return 0U;
-    vTaskDelay(pdMS_TO_TICKS(BUTTON_DEBOUNCE_MS));
-    if (!board_button_pressed()) return 0U;
-    uint32_t held_ms = BUTTON_DEBOUNCE_MS;
-    while (board_button_pressed() && held_ms < maximum_ms) {
-        vTaskDelay(pdMS_TO_TICKS(BUTTON_POLL_MS));
-        held_ms += BUTTON_POLL_MS;
-    }
-    return held_ms;
-}
-
 void board_led_status(float moisture_pct, bool diagnostic_fault, bool manual)
 {
     set_leds(false, false, false);
@@ -346,45 +341,170 @@ void board_led_status(float moisture_pct, bool diagnostic_fault, bool manual)
     }
 }
 
-void board_indicator_ota_ready(void)
+/*
+ * LED indicator scripts run on a dedicated low-priority task fed by a queue.
+ * Several indicators (OTA progress/failure) are triggered from the Zigbee
+ * mainloop task, which must never block on vTaskDelay: a 400 ms blink would
+ * stall the whole Zigbee stack, including the ZCL response it owes the
+ * coordinator. board_indicator_ota_success() is the exception: it is called
+ * only immediately before esp_restart(), so it stays synchronous to guarantee
+ * the flashes are actually shown.
+ */
+typedef struct {
+    bool red;
+    bool yellow;
+    bool green;
+    uint32_t on_ms;
+    uint32_t off_ms;
+    uint8_t repeat;
+} led_script_step_t;
+
+typedef enum {
+    INDICATOR_SCRIPT_OTA_READY = 0,
+    INDICATOR_SCRIPT_OTA_WAITING,
+    INDICATOR_SCRIPT_OTA_PROGRESS,
+    INDICATOR_SCRIPT_OTA_FAILURE,
+    INDICATOR_SCRIPT_IDENTIFY,
+    INDICATOR_SCRIPT_FACTORY_RESET_WARNING,
+    INDICATOR_SCRIPT_FACTORY_RESET_CONFIRMED,
+    INDICATOR_SCRIPT_COUNT,
+} indicator_script_id_t;
+
+static const led_script_step_t s_ota_ready_script[] = {
+    {true, false, false, SHORT_BLINK_MS, STATUS_GAP_MS, 1U},
+    {false, true, false, SHORT_BLINK_MS, STATUS_GAP_MS, 1U},
+    {false, false, true, SHORT_BLINK_MS, 0U, 1U},
+};
+static const led_script_step_t s_ota_waiting_script[] = {
+    {false, true, false, 80U, 0U, 1U},
+};
+static const led_script_step_t s_ota_progress_script[] = {
+    {false, true, false, 45U, 0U, 1U},
+};
+static const led_script_step_t s_ota_failure_script[] = {
+    {true, false, false, SHORT_BLINK_MS, STATUS_GAP_MS, 3U},
+};
+static const led_script_step_t s_identify_script[] = {
+    {true, false, false, 100U, 60U, 1U},
+    {false, true, false, 100U, 60U, 1U},
+    {false, false, true, 100U, 60U, 1U},
+    {true, false, false, 100U, 60U, 1U},
+    {false, true, false, 100U, 60U, 1U},
+    {false, false, true, 100U, 60U, 1U},
+};
+static const led_script_step_t s_factory_reset_warning_script[] = {
+    {true, false, false, 100U, 60U, 1U},
+    {false, false, true, 100U, 60U, 1U},
+    {true, false, false, 100U, 60U, 1U},
+    {false, false, true, 100U, 60U, 1U},
+    {true, false, false, 100U, 60U, 1U},
+    {false, false, true, 100U, 60U, 1U},
+    {true, false, false, 100U, 60U, 1U},
+    {false, false, true, 100U, 60U, 1U},
+};
+static const led_script_step_t s_factory_reset_confirmed_script[] = {
+    {true, true, true, SHORT_BLINK_MS, STATUS_GAP_MS, 3U},
+};
+
+typedef struct {
+    const led_script_step_t *steps;
+    size_t count;
+} led_script_t;
+
+static const led_script_t s_indicator_scripts[INDICATOR_SCRIPT_COUNT] = {
+    [INDICATOR_SCRIPT_OTA_READY] = {s_ota_ready_script,
+                                    sizeof(s_ota_ready_script) /
+                                        sizeof(s_ota_ready_script[0])},
+    [INDICATOR_SCRIPT_OTA_WAITING] = {s_ota_waiting_script,
+                                      sizeof(s_ota_waiting_script) /
+                                          sizeof(s_ota_waiting_script[0])},
+    [INDICATOR_SCRIPT_OTA_PROGRESS] = {s_ota_progress_script,
+                                       sizeof(s_ota_progress_script) /
+                                           sizeof(s_ota_progress_script[0])},
+    [INDICATOR_SCRIPT_OTA_FAILURE] = {s_ota_failure_script,
+                                      sizeof(s_ota_failure_script) /
+                                          sizeof(s_ota_failure_script[0])},
+    [INDICATOR_SCRIPT_IDENTIFY] = {s_identify_script,
+                                   sizeof(s_identify_script) /
+                                       sizeof(s_identify_script[0])},
+    [INDICATOR_SCRIPT_FACTORY_RESET_WARNING] = {s_factory_reset_warning_script,
+                                                sizeof(s_factory_reset_warning_script) /
+                                                    sizeof(s_factory_reset_warning_script[0])},
+    [INDICATOR_SCRIPT_FACTORY_RESET_CONFIRMED] = {s_factory_reset_confirmed_script,
+                                                  sizeof(s_factory_reset_confirmed_script) /
+                                                      sizeof(s_factory_reset_confirmed_script[0])},
+};
+
+static QueueHandle_t s_indicator_queue;
+
+static void indicator_task(void *arg)
 {
-    led_step(true, false, false, SHORT_BLINK_MS, STATUS_GAP_MS);
-    led_step(false, true, false, SHORT_BLINK_MS, STATUS_GAP_MS);
-    led_step(false, false, true, SHORT_BLINK_MS, 0U);
+    (void)arg;
+    indicator_script_id_t script;
+    while (xQueueReceive(s_indicator_queue, &script, portMAX_DELAY) == pdTRUE) {
+        if (script >= INDICATOR_SCRIPT_COUNT) continue;
+        const led_script_t *run = &s_indicator_scripts[script];
+        for (size_t i = 0; i < run->count; ++i) {
+            const led_script_step_t *step = &run->steps[i];
+            for (unsigned repeat = 0U; repeat < step->repeat; ++repeat) {
+                /* led_step() clears the LEDs after on_ms; the off-gap runs only
+                 * between repeats, matching repeat_led() so identical visual
+                 * patterns behave the same on both primitives. */
+                led_step(step->red, step->yellow, step->green, step->on_ms,
+                         repeat + 1U < step->repeat ? step->off_ms : 0U);
+            }
+        }
+    }
 }
 
-void board_indicator_ota_waiting(void) { led_step(false, true, false, 80U, 0U); }
+static void queue_indicator_script(indicator_script_id_t script)
+{
+    if (script >= INDICATOR_SCRIPT_COUNT) return;
+    if (!s_indicator_queue) {
+        s_indicator_queue = xQueueCreate(4U, sizeof(indicator_script_id_t));
+        if (!s_indicator_queue) return;
+        if (xTaskCreate(indicator_task, "indicator", 2048, NULL, 2,
+                        NULL) != pdPASS) {
+            vQueueDelete(s_indicator_queue);
+            s_indicator_queue = NULL;
+            return;
+        }
+    }
+    /* Best-effort: a full queue drops the request rather than blocking callers
+     * (the Zigbee mainloop task calls these functions). */
+    (void)xQueueSend(s_indicator_queue, &script, 0U);
+}
+
+void board_indicator_ota_ready(void) { queue_indicator_script(INDICATOR_SCRIPT_OTA_READY); }
+
+void board_indicator_ota_waiting(void) { queue_indicator_script(INDICATOR_SCRIPT_OTA_WAITING); }
 
 void board_indicator_ota_progress(uint8_t percent)
 {
     if (percent == 0U || percent >= 100U || (percent % 10U) != 0U) return;
-    led_step(false, true, false, 45U, 0U);
+    queue_indicator_script(INDICATOR_SCRIPT_OTA_PROGRESS);
 }
 
-void board_indicator_ota_success(void) { repeat_led(false, false, true, 3U); }
-void board_indicator_ota_failure(void) { repeat_led(true, false, false, 3U); }
-void board_indicator_ota_low_battery(void) { repeat_led(true, false, false, 3U); }
-
-void board_indicator_identify(void)
+void board_indicator_ota_success(void)
 {
-    for (unsigned i = 0; i < 2U; ++i) {
-        led_step(true, false, false, 100U, 60U);
-        led_step(false, true, false, 100U, 60U);
-        led_step(false, false, true, 100U, 60U);
-    }
+    /* Synchronous on purpose: the only caller (OTA FINISH) reboots immediately
+     * afterwards, so an async script could never be shown. */
+    repeat_led(false, false, true, 3U);
 }
+
+void board_indicator_ota_failure(void) { queue_indicator_script(INDICATOR_SCRIPT_OTA_FAILURE); }
+void board_indicator_ota_low_battery(void) { queue_indicator_script(INDICATOR_SCRIPT_OTA_FAILURE); }
+
+void board_indicator_identify(void) { queue_indicator_script(INDICATOR_SCRIPT_IDENTIFY); }
 
 void board_indicator_factory_reset_warning(void)
 {
-    for (unsigned i = 0; i < 4U; ++i) {
-        led_step(true, false, false, 100U, 60U);
-        led_step(false, false, true, 100U, 60U);
-    }
+    queue_indicator_script(INDICATOR_SCRIPT_FACTORY_RESET_WARNING);
 }
 
 void board_indicator_factory_reset_confirmed(void)
 {
-    repeat_led(true, true, true, 3U);
+    queue_indicator_script(INDICATOR_SCRIPT_FACTORY_RESET_CONFIRMED);
 }
 
 esp_err_t board_pairing_indicator_start(void)

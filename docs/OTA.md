@@ -4,11 +4,11 @@ Soil Sentinel uses the standard Zigbee OTA Upgrade client cluster. The firmware 
 
 ## Build an OTA release
 
-Update all three version locations before building:
+Update the single version source before building:
 
-1. `PROJECT_VER` in the root `CMakeLists.txt`
-2. `SOIL_OTA_FILE_VERSION` in `main/firmware_update.h`
-3. `--version-name` and `--file-version` in `scripts/build-release.sh`
+1. `PROJECT_VER` in the root `CMakeLists.txt` — everything derives from this value. `SOIL_OTA_FILE_VERSION` in `main/firmware_update.h` is computed from `PROJECT_VER_MAJOR/MINOR/PATCH` at compile time (`major << 16 | minor << 8 | patch`; for `1.0.2` that is `0x00010002UL`), `build-zigbee-ota.py` computes the container `file_version` and `version-name` from the same `PROJECT_VER`, and `build-release.sh` passes no explicit version arguments, so the firmware, container, and index always agree.
+
+An explicitly passed `--file-version` or `--version-name` that disagrees with `PROJECT_VER` is now a build error rather than a silently inconsistent release.
 
 Then run:
 

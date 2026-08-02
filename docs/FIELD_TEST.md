@@ -31,7 +31,7 @@ idf.py -p /dev/ttyACM0 erase-flash flash monitor
 
 This migration erases the old Zigbee pairing because the dual-slot partition table relocates Zigbee storage. Pair the test unit again in ZHA.
 
-Sensors already using the dual-slot 1.0 layout must **not** be erased for 1.0.1; use normal serial flashing or Zigbee OTA so pairing and calibration survive.
+Sensors already using the dual-slot 1.0 layout must **not** be erased for 1.0.2; use normal serial flashing or Zigbee OTA so pairing and calibration survive.
 
 ## 3. Basic behavior
 

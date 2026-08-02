@@ -7,8 +7,30 @@
 
 #define SOIL_OTA_MANUFACTURER_CODE 0xFFF1U
 #define SOIL_OTA_IMAGE_TYPE        0x0001U
-#define SOIL_OTA_FILE_VERSION      0x00010001UL
 #define SOIL_OTA_MIN_BATTERY_MV    1250.0f
+
+/*
+ * The Zigbee OTA file version is derived from PROJECT_VER (CMakeLists.txt) as
+ * 0xMMmmpp so it always tracks the build: the coordinator refuses to offer any
+ * image whose version is not newer than the client's advertised one, so a
+ * hand-maintained constant was a silent release breaker. The ESP-IDF build
+ * defines PROJECT_VER_MAJOR/MINOR/PATCH when PROJECT_VER matches x.y.z; the
+ * fallbacks below keep out-of-tree builds compiling and MUST stay in sync with
+ * CMakeLists.txt. If the build provides a PROJECT_VER that is not x.y.z, fail
+ * loudly instead of silently advertising a possibly-stale version.
+ */
+#if defined(PROJECT_VER) && !defined(PROJECT_VER_MAJOR)
+#error "PROJECT_VER is not x.y.z: fix CMakeLists.txt or the SOIL_OTA_FILE_VERSION fallback in firmware_update.h"
+#endif
+#ifndef PROJECT_VER_MAJOR
+#define PROJECT_VER_MAJOR 1
+#define PROJECT_VER_MINOR 0
+#define PROJECT_VER_PATCH 2
+#endif
+#define SOIL_OTA_FILE_VERSION                                                    \
+    ((((uint32_t)(PROJECT_VER_MAJOR) & 0xFFU) << 16U) |                         \
+     (((uint32_t)(PROJECT_VER_MINOR) & 0xFFU) << 8U) |                          \
+     ((uint32_t)(PROJECT_VER_PATCH) & 0xFFU))
 
 typedef enum {
     SOIL_OTA_STATE_IDLE = 0,

@@ -15,3 +15,7 @@ CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
 # CONFIG_ESP_CONSOLE_UART_DEFAULT is not set
 CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
 # CONFIG_ESPTOOLPY_FLASHSIZE_2MB is not set
+# app_main walks the deepest call chains (ADC sample arrays + qsort, OTA window);
+# leave headroom over the IDF default so a stack overflow cannot surface only as
+# a random crash in the middle of an OTA.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=6144

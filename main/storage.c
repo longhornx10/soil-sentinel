@@ -2,6 +2,7 @@
 
 #include <string.h>
 #include "esp_attr.h"
+#include "esp_log.h"
 #include "nvs.h"
 #include "nvs_flash.h"
 
@@ -12,6 +13,8 @@
 #define BUNDLE_MAGIC 0x42554E44u
 #define BUNDLE_VERSION 5u
 #define BUNDLE_KEY "bundle_v5"
+
+static const char *TAG = "storage";
 
 #define LEGACY_POLICY_MAGIC 0x504F4C59u
 #define LEGACY_STATE_MAGIC 0x53544154u
@@ -194,12 +197,18 @@ esp_err_t storage_load(soil_policy_t *policy, soil_state_t *state)
         }
         state->applied_config_revision = policy->config_revision;
         soil_resolve_active_curve(policy, state);
-        (void)storage_save_checkpoint(policy, state);
+        if (storage_save_checkpoint(policy, state) != ESP_OK) {
+            ESP_LOGW(TAG, "failed to persist migrated configuration");
+        }
     }
 
-    if (s_runtime.magic == RUNTIME_MAGIC && s_runtime.version == RUNTIME_VERSION) {
+    if (s_runtime.magic == RUNTIME_MAGIC && s_runtime.version == RUNTIME_VERSION &&
+        s_runtime.state.applied_config_revision >= policy->config_revision) {
         /* RTC is the newest deep-sleep state, including learning updates that have not
-         * yet reached the sparse NVS checkpoint. NVS remains the cold-boot fallback. */
+         * yet reached the sparse NVS checkpoint. NVS remains the cold-boot fallback.
+         * Only override when the RTC state is at least as fresh as the loaded policy:
+         * a reset between a checkpoint write and the RTC save must not resurrect a
+         * stale state labeled with a config revision it never applied. */
         *state = s_runtime.state;
         state->applied_config_revision = policy->config_revision;
     }

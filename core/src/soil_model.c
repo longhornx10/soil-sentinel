@@ -15,6 +15,36 @@
 #define BATTERY_CONSERVATION_ENTER_PCT 20.0f
 #define BATTERY_CONSERVATION_EXIT_PCT 23.0f
 
+/* EMA weights: previous-sample vs new-sample contribution. The 0.75/0.25 pair
+   drives both the learned dry/wet refinement and the drying-rate EMA; the
+   0.9/0.1 pair refines dry/wet candidates; 0.95/0.05 refines the learned wet
+   anchor while only a wet candidate is available. */
+#define SOIL_EMA_PREVIOUS_WEIGHT 0.75f
+#define SOIL_EMA_NEW_WEIGHT 0.25f
+#define SOIL_CANDIDATE_EMA_PREVIOUS_WEIGHT 0.9f
+#define SOIL_CANDIDATE_EMA_NEW_WEIGHT 0.1f
+#define SOIL_LEARNED_WET_EMA_PREVIOUS_WEIGHT 0.95f
+#define SOIL_LEARNED_WET_EMA_NEW_WEIGHT 0.05f
+
+/* Learning-confidence formula: confidence starts blending in at
+   SOIL_CONFIDENCE_MIN_PCT and reaches full blend over
+   SOIL_CONFIDENCE_BLEND_RANGE_PCT; each cycle adds
+   SOIL_CONFIDENCE_PER_CYCLE_PCT, plus a span bonus capped at
+   SOIL_CONFIDENCE_SPAN_BONUS_MAX_PCT that scales by
+   SOIL_CONFIDENCE_SPAN_BONUS_DIVISOR. */
+#define SOIL_CONFIDENCE_MIN_PCT 40.0f
+#define SOIL_CONFIDENCE_BLEND_RANGE_PCT 60.0f
+#define SOIL_CONFIDENCE_PER_CYCLE_PCT 25.0f
+#define SOIL_CONFIDENCE_SPAN_BONUS_MAX_PCT 25.0f
+#define SOIL_CONFIDENCE_SPAN_BONUS_DIVISOR 20.0f
+
+/* Mode timing */
+#define SOIL_DRYING_RATE_TRIGGER_PCT_PER_HOUR 0.2f
+#define SOIL_RECENTLY_WATERED_WINDOW_SECONDS (1u * 60u * 60u)
+#define SOIL_DRY_ANCHOR_EXCLUSION_SECONDS (6u * 60u * 60u)
+#define SOIL_SURVIVAL_INTERVAL_SECONDS (12u * 60u * 60u)
+#define SOIL_HARD_FAULT_CONSERVATION_INTERVAL_SECONDS (6u * 60u * 60u)
+
 static float clampf(float value, float low, float high)
 {
     if (value < low) return low;
@@ -77,23 +107,40 @@ static float measurement_confidence(float noise_mv, bool noise_fault)
                : clampf(100.0f - noise_mv * 0.8f, 0.0f, 100.0f);
 }
 
-static void apply_battery_mode(soil_state_t *state, soil_mode_t previous_mode)
+static void apply_battery_mode(soil_state_t *state,
+                               soil_mode_t previous_mode,
+                               bool battery_valid)
 {
     if (!state->battery_present) return;
-
-    if (battery_survival_active(state->battery_pct, previous_mode)) {
-        state->mode = SOIL_MODE_SURVIVAL;
-        state->sample_interval_seconds = 12u * 60u * 60u;
+    if (!battery_valid) {
+        /* A glitched reading is not a battery verdict: keep an already active
+         * battery-driven mode instead of reverting to fast soil sampling on a
+         * nearly-dead battery. */
+        if (previous_mode == SOIL_MODE_SURVIVAL) {
+            state->mode = SOIL_MODE_SURVIVAL;
+            state->sample_interval_seconds = SOIL_SURVIVAL_INTERVAL_SECONDS;
+        } else if (previous_mode == SOIL_MODE_CONSERVATION) {
+            state->mode = SOIL_MODE_CONSERVATION;
+            state->sample_interval_seconds = SOIL_SURVIVAL_INTERVAL_SECONDS;
+        }
         return;
     }
 
+    if (battery_survival_active(state->battery_pct, previous_mode)) {
+        state->mode = SOIL_MODE_SURVIVAL;
+        state->sample_interval_seconds = SOIL_SURVIVAL_INTERVAL_SECONDS;
+        return;
+    }
+
+    /* Conservation intentionally engages only from STABLE (soil-healthy);
+       SURVIVAL remains the unconditional low-battery fallback. */
     const bool conservation_active =
         state->battery_pct <= BATTERY_CONSERVATION_ENTER_PCT ||
         (previous_mode == SOIL_MODE_CONSERVATION &&
          state->battery_pct < BATTERY_CONSERVATION_EXIT_PCT);
     if (conservation_active && state->mode == SOIL_MODE_STABLE) {
         state->mode = SOIL_MODE_CONSERVATION;
-        state->sample_interval_seconds = 12u * 60u * 60u;
+        state->sample_interval_seconds = SOIL_SURVIVAL_INTERVAL_SECONDS;
     }
 }
 
@@ -137,6 +184,14 @@ bool soil_policy_validate(const soil_policy_t *policy, soil_config_result_t *res
                policy->dry_threshold_pct > 100.0f ||
                policy->critical_threshold_pct >= policy->dry_threshold_pct) {
         local = SOIL_CONFIG_REJECT_THRESHOLDS;
+    } else if (!isfinite(policy->report_delta_pct) ||
+               policy->report_delta_pct <= 0.0f ||
+               !isfinite(policy->watering_delta_pct) ||
+               policy->watering_delta_pct <= 0.0f ||
+               !isfinite(policy->noise_fault_mv) ||
+               policy->noise_fault_mv < 0.0f ||
+               policy->heartbeat_seconds == 0U) {
+        local = SOIL_CONFIG_REJECT_POLICY;
     }
     if (result) *result = local;
     return local == SOIL_CONFIG_OK;
@@ -144,7 +199,8 @@ bool soil_policy_validate(const soil_policy_t *policy, soil_config_result_t *res
 
 soil_config_result_t soil_policy_set_mode(soil_policy_t *policy, soil_calibration_mode_t mode)
 {
-    if (!policy || mode > SOIL_CALIBRATION_MANUAL) return SOIL_CONFIG_REJECT_MODE;
+    if (!policy) return SOIL_CONFIG_REJECT_INVALID_ARG;
+    if (mode > SOIL_CALIBRATION_MANUAL) return SOIL_CONFIG_REJECT_MODE;
     soil_policy_t candidate = *policy;
     candidate.calibration_mode = mode;
     soil_config_result_t result;
@@ -156,7 +212,7 @@ soil_config_result_t soil_policy_set_mode(soil_policy_t *policy, soil_calibratio
 
 soil_config_result_t soil_policy_set_manual_bounds(soil_policy_t *policy, float dry_mv, float wet_mv)
 {
-    if (!policy) return SOIL_CONFIG_REJECT_ADC_RANGE;
+    if (!policy) return SOIL_CONFIG_REJECT_INVALID_ARG;
     if (!isfinite(dry_mv) || !isfinite(wet_mv) ||
         dry_mv < SOIL_ADC_MIN_MV || dry_mv > SOIL_ADC_MAX_MV ||
         wet_mv < SOIL_ADC_MIN_MV || wet_mv > SOIL_ADC_MAX_MV) {
@@ -173,7 +229,8 @@ soil_config_result_t soil_policy_set_manual_bounds(soil_policy_t *policy, float 
 
 soil_config_result_t soil_policy_set_thresholds(soil_policy_t *policy, float dry_pct, float critical_pct)
 {
-    if (!policy || !isfinite(dry_pct) || !isfinite(critical_pct) ||
+    if (!policy) return SOIL_CONFIG_REJECT_INVALID_ARG;
+    if (!isfinite(dry_pct) || !isfinite(critical_pct) ||
         critical_pct < 0.0f || dry_pct > 100.0f || critical_pct >= dry_pct) {
         return SOIL_CONFIG_REJECT_THRESHOLDS;
     }
@@ -192,8 +249,8 @@ soil_config_result_t soil_policy_apply_configuration(
     float critical_threshold_pct,
     uint32_t revision)
 {
-    if (!policy) return SOIL_CONFIG_REJECT_PERSISTENCE;
-    if (revision <= policy->config_revision) return SOIL_CONFIG_OK;
+    if (!policy) return SOIL_CONFIG_REJECT_INVALID_ARG;
+    if (revision <= policy->config_revision) return SOIL_CONFIG_REJECT_STALE_REVISION;
 
     soil_policy_t candidate = *policy;
     candidate.calibration_mode = mode;
@@ -244,11 +301,13 @@ void soil_resolve_active_curve(const soil_policy_t *policy, soil_state_t *state)
 
     if (policy->calibration_mode == SOIL_CALIBRATION_LEARNING) {
         if (state->learning_cycle_count >= SOIL_MIN_LEARNING_CYCLES &&
-            state->learning_confidence_pct >= 40.0f &&
+            state->learning_confidence_pct >= SOIL_CONFIDENCE_MIN_PCT &&
             bounds_valid(state->learned_dry_raw_mv, state->learned_wet_raw_mv,
                          SOIL_MIN_LEARNED_SPAN_MV)) {
-            const float blend = clampf((state->learning_confidence_pct - 40.0f) / 60.0f,
-                                       0.0f, 1.0f);
+            const float blend =
+                clampf((state->learning_confidence_pct - SOIL_CONFIDENCE_MIN_PCT) /
+                           SOIL_CONFIDENCE_BLEND_RANGE_PCT,
+                       0.0f, 1.0f);
             state->active_dry_raw_mv =
                 policy->dry_raw_mv * (1.0f - blend) + state->learned_dry_raw_mv * blend;
             state->active_wet_raw_mv =
@@ -279,13 +338,16 @@ static void update_learning(const soil_policy_t *policy,
     }
 
     if (stock_moisture <= policy->dry_threshold_pct &&
-        (!state->has_watered || state->seconds_since_watering >= 6u * 60u * 60u)) {
+        (!state->has_watered ||
+         state->seconds_since_watering >= SOIL_DRY_ANCHOR_EXCLUSION_SECONDS)) {
         if (!state->learning_has_dry_candidate ||
             sample->raw_mv > state->learning_dry_candidate_mv) {
             state->learning_dry_candidate_mv = sample->raw_mv;
         } else {
             state->learning_dry_candidate_mv =
-                0.9f * state->learning_dry_candidate_mv + 0.1f * sample->raw_mv;
+                SOIL_CANDIDATE_EMA_PREVIOUS_WEIGHT *
+                    state->learning_dry_candidate_mv +
+                SOIL_CANDIDATE_EMA_NEW_WEIGHT * sample->raw_mv;
         }
         state->learning_has_dry_candidate = true;
     }
@@ -303,20 +365,24 @@ static void update_learning(const soil_policy_t *policy,
                 state->learned_wet_raw_mv = state->learning_wet_candidate_mv;
             } else {
                 state->learned_dry_raw_mv =
-                    0.75f * state->learned_dry_raw_mv +
-                    0.25f * state->learning_dry_candidate_mv;
+                    SOIL_EMA_PREVIOUS_WEIGHT * state->learned_dry_raw_mv +
+                    SOIL_EMA_NEW_WEIGHT * state->learning_dry_candidate_mv;
                 state->learned_wet_raw_mv =
-                    0.75f * state->learned_wet_raw_mv +
-                    0.25f * state->learning_wet_candidate_mv;
+                    SOIL_EMA_PREVIOUS_WEIGHT * state->learned_wet_raw_mv +
+                    SOIL_EMA_NEW_WEIGHT * state->learning_wet_candidate_mv;
             }
             if (state->learning_cycle_count < UINT32_MAX) {
                 state->learning_cycle_count++;
             }
             const float span = state->learned_dry_raw_mv - state->learned_wet_raw_mv;
-            const float span_bonus = clampf((span - SOIL_MIN_LEARNED_SPAN_MV) / 20.0f,
-                                            0.0f, 25.0f);
+            const float span_bonus =
+                clampf((span - SOIL_MIN_LEARNED_SPAN_MV) /
+                           SOIL_CONFIDENCE_SPAN_BONUS_DIVISOR,
+                       0.0f, SOIL_CONFIDENCE_SPAN_BONUS_MAX_PCT);
             state->learning_confidence_pct =
-                clampf(state->learning_cycle_count * 25.0f + span_bonus, 0.0f, 100.0f);
+                clampf(state->learning_cycle_count * SOIL_CONFIDENCE_PER_CYCLE_PCT +
+                           span_bonus,
+                       0.0f, 100.0f);
             state->learning_has_dry_candidate = false;
         }
     } else if ((state->mode == SOIL_MODE_WATERING_CAPTURE ||
@@ -324,10 +390,14 @@ static void update_learning(const soil_policy_t *policy,
                state->learning_has_wet_candidate &&
                sample->raw_mv < state->learning_wet_candidate_mv) {
         state->learning_wet_candidate_mv =
-            0.9f * state->learning_wet_candidate_mv + 0.1f * sample->raw_mv;
+            SOIL_CANDIDATE_EMA_PREVIOUS_WEIGHT *
+                state->learning_wet_candidate_mv +
+            SOIL_CANDIDATE_EMA_NEW_WEIGHT * sample->raw_mv;
         if (state->learning_cycle_count > 0U) {
             state->learned_wet_raw_mv =
-                0.95f * state->learned_wet_raw_mv + 0.05f * sample->raw_mv;
+                SOIL_LEARNED_WET_EMA_PREVIOUS_WEIGHT *
+                    state->learned_wet_raw_mv +
+                SOIL_LEARNED_WET_EMA_NEW_WEIGHT * sample->raw_mv;
         }
     }
 }
@@ -338,7 +408,7 @@ soil_config_result_t soil_apply_control_action(
     soil_control_action_t action,
     float current_raw_mv)
 {
-    if (!policy || !state) return SOIL_CONFIG_REJECT_ADC_RANGE;
+    if (!policy || !state) return SOIL_CONFIG_REJECT_INVALID_ARG;
 
     soil_config_result_t result = SOIL_CONFIG_OK;
     switch (action) {
@@ -370,7 +440,6 @@ soil_config_result_t soil_apply_control_action(
     case SOIL_ACTION_RESET_LEARNING:
     case SOIL_ACTION_PLANT_MOVED:
         soil_learning_reset(state);
-        policy_touch(policy);
         break;
     case SOIL_ACTION_RESTORE_MANUAL_STOCK:
         result = soil_policy_set_manual_bounds(
@@ -378,7 +447,8 @@ soil_config_result_t soil_apply_control_action(
         break;
     case SOIL_ACTION_IDENTIFY:
     case SOIL_ACTION_NONE:
-        break;
+        /* No-ops: return OK without pretending a config change happened. */
+        return SOIL_CONFIG_OK;
     default:
         result = SOIL_CONFIG_REJECT_MODE;
         break;
@@ -391,6 +461,7 @@ soil_config_result_t soil_apply_control_action(
         state->should_report = true;
         state->seconds_since_report = 0U;
         soil_resolve_active_curve(policy, state);
+        if (state->has_valid_moisture) state->last_reported_pct = state->moisture_pct;
     }
     return result;
 }
@@ -441,6 +512,9 @@ void soil_model_step(const soil_policy_t *policy,
     const float previous_battery_pct = state->battery_pct;
     const soil_mode_t previous_mode = state->mode;
     const float previous_raw_mv = state->previous_raw_mv;
+    const bool battery_valid =
+        sample->battery_present && isfinite(sample->battery_mv) &&
+        sample->battery_mv > 0.0f;
 
     soil_resolve_active_curve(policy, state);
     const float moisture = soil_calibrated_percent(
@@ -469,7 +543,7 @@ void soil_model_step(const soil_policy_t *policy,
                                sample->elapsed_seconds);
     }
 
-    if (sample->battery_present) {
+    if (battery_valid) {
         state->battery_pct = soil_battery_percent(sample->battery_mv);
     }
 
@@ -478,11 +552,15 @@ void soil_model_step(const soil_policy_t *policy,
     }
     state->sensor_fault = fault_now;
 
-    if (sample->battery_present &&
+    if (battery_valid &&
         battery_event_changed(previous_battery_present,
                               previous_battery_pct,
                               state->battery_pct,
                               previous_mode)) {
+        state->event_flags |= SOIL_EVENT_BATTERY;
+    }
+    /* Battery removal was previously silent; surface it as an event. */
+    if (!sample->battery_present && previous_battery_present) {
         state->event_flags |= SOIL_EVENT_BATTERY;
     }
 
@@ -490,13 +568,14 @@ void soil_model_step(const soil_policy_t *policy,
         state->initialized = true;
         state->confidence_pct = 0.0f;
         state->mode =
-            sample->battery_present &&
-                    battery_survival_active(state->battery_pct, previous_mode)
+            (battery_valid &&
+                     battery_survival_active(state->battery_pct, previous_mode)) ||
+                    (!battery_valid && previous_mode == SOIL_MODE_SURVIVAL)
                 ? SOIL_MODE_SURVIVAL
                 : SOIL_MODE_CONSERVATION;
         state->sample_interval_seconds =
-            state->mode == SOIL_MODE_SURVIVAL ? 12u * 60u * 60u
-                                              : 6u * 60u * 60u;
+            state->mode == SOIL_MODE_SURVIVAL ? SOIL_SURVIVAL_INTERVAL_SECONDS
+                                              : SOIL_HARD_FAULT_CONSERVATION_INTERVAL_SECONDS;
         if (state->seconds_since_report >= policy->heartbeat_seconds)
             state->event_flags |= SOIL_EVENT_HEARTBEAT;
         if (sample->manual_sample) state->event_flags |= SOIL_EVENT_MANUAL;
@@ -528,7 +607,7 @@ void soil_model_step(const soil_policy_t *policy,
                 : state->mode == SOIL_MODE_NEAR_DRY
                       ? policy->near_dry_sample_seconds
                       : policy->stable_sample_seconds;
-        apply_battery_mode(state, previous_mode);
+        apply_battery_mode(state, previous_mode, battery_valid);
         update_learning(policy, sample, state, stock_moisture, false);
         state->event_flags |= SOIL_EVENT_HEARTBEAT;
         if (sample->manual_sample) state->event_flags |= SOIL_EVENT_MANUAL;
@@ -547,10 +626,15 @@ void soil_model_step(const soil_policy_t *policy,
 
     if (sample->elapsed_seconds > 0U) {
         const float hours = sample->elapsed_seconds / 3600.0f;
-        const float instantaneous_rate = -delta / hours;
+        float instantaneous_rate = -delta / hours;
+        if (watering_jump) {
+            /* A watering jump is not drying; never let it drag the EMA
+               strongly negative and delay DRYING detection. */
+            instantaneous_rate = fmaxf(instantaneous_rate, 0.0f);
+        }
         state->drying_rate_pct_per_hour =
-            0.75f * state->drying_rate_pct_per_hour +
-            0.25f * instantaneous_rate;
+            SOIL_EMA_PREVIOUS_WEIGHT * state->drying_rate_pct_per_hour +
+            SOIL_EMA_NEW_WEIGHT * instantaneous_rate;
     }
     state->confidence_pct =
         measurement_confidence(sample->noise_mv, noise_fault);
@@ -561,14 +645,10 @@ void soil_model_step(const soil_policy_t *policy,
         state->has_watered = true;
         state->seconds_since_watering = 0U;
         state->event_flags |= SOIL_EVENT_WATERING;
-    } else if (previous_mode == SOIL_MODE_WATERING_CAPTURE) {
-        state->mode = SOIL_MODE_RECENTLY_WATERED;
-        state->sample_interval_seconds = policy->recent_water_sample_seconds;
-    } else if (previous_mode == SOIL_MODE_RECENTLY_WATERED &&
-               state->seconds_since_watering < 60u * 60u) {
-        state->mode = SOIL_MODE_RECENTLY_WATERED;
-        state->sample_interval_seconds = policy->recent_water_sample_seconds;
     } else if (moisture <= policy->critical_threshold_pct) {
+        /* Critical/near-dry thresholds take priority over recently-watered
+           retention so a critical reading within the watering window is still
+           flagged instead of being hidden as RECENTLY_WATERED. */
         if (previous_mode != SOIL_MODE_CRITICAL)
             state->event_flags |= SOIL_EVENT_THRESHOLD;
         state->mode = SOIL_MODE_CRITICAL;
@@ -578,7 +658,15 @@ void soil_model_step(const soil_policy_t *policy,
             state->event_flags |= SOIL_EVENT_THRESHOLD;
         state->mode = SOIL_MODE_NEAR_DRY;
         state->sample_interval_seconds = policy->near_dry_sample_seconds;
-    } else if (state->drying_rate_pct_per_hour > 0.2f) {
+    } else if (previous_mode == SOIL_MODE_WATERING_CAPTURE) {
+        state->mode = SOIL_MODE_RECENTLY_WATERED;
+        state->sample_interval_seconds = policy->recent_water_sample_seconds;
+    } else if (previous_mode == SOIL_MODE_RECENTLY_WATERED &&
+               state->seconds_since_watering < SOIL_RECENTLY_WATERED_WINDOW_SECONDS) {
+        state->mode = SOIL_MODE_RECENTLY_WATERED;
+        state->sample_interval_seconds = policy->recent_water_sample_seconds;
+    } else if (state->drying_rate_pct_per_hour >
+               SOIL_DRYING_RATE_TRIGGER_PCT_PER_HOUR) {
         state->mode = SOIL_MODE_DRYING;
         state->sample_interval_seconds = policy->drying_sample_seconds;
     } else {
@@ -589,7 +677,7 @@ void soil_model_step(const soil_policy_t *policy,
     update_learning(policy, sample, state, stock_moisture, watering_jump);
     soil_resolve_active_curve(policy, state);
     state->previous_raw_mv = sample->raw_mv;
-    apply_battery_mode(state, previous_mode);
+    apply_battery_mode(state, previous_mode, battery_valid);
 
     if (state->mode != previous_mode) state->event_flags |= SOIL_EVENT_MODE;
     if (fabsf(moisture - state->last_reported_pct) >=

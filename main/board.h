@@ -15,7 +15,6 @@ esp_err_t board_measure(board_measurement_t *out);
 esp_err_t board_read_battery_mv(float *battery_mv);
 void board_prepare_sleep(void);
 bool board_button_pressed(void);
-uint32_t board_measure_button_hold_ms(uint32_t maximum_ms);
 void board_led_status(float moisture_pct, bool diagnostic_fault, bool manual);
 
 void board_indicator_ota_ready(void);

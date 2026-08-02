@@ -2,7 +2,7 @@
 
 Native ESP-IDF firmware for the Seeed Studio XIAO ESP32-C6 Soil Moisture Sensor. It provides native Zigbee reporting, three moisture-calibration modes, queued Home Assistant controls, manually armed Zigbee OTA updates, and aggressive deep-sleep power management for one alkaline AA cell.
 
-## Field-ready 1.0.1 bundle
+## Field-ready 1.0.2 bundle
 
 - ESP-IDF 5.5.4 and ESP Zigbee SDK 2.x sleepy-end-device firmware
 - No Wi-Fi initialization or Wi-Fi runtime
@@ -100,7 +100,7 @@ source ~/esp/esp-idf/export.sh
 Outputs:
 
 - `build/soil_sentinel.bin`: raw ESP-IDF application image
-- `dist/soil-sentinel-1.0.1.ota`: Zigbee OTA container
+- `dist/soil-sentinel-1.0.2.ota`: Zigbee OTA container
 - `dist/index.json`: local zigpy OTA index
 - `dist/SHA256SUMS`: release checksums
 
@@ -155,4 +155,4 @@ The host logic suite currently covers:
 - alkaline low-battery behavior
 - OTA/refusal/factory-reset button policy
 
-The 1.0.1 OTA recovery and RF-switch power changes require the physical checks in `docs/FIELD_TEST.md`. An ESP-IDF build and physical-board validation remain mandatory because Zigbee SDK APIs, ADC behavior, current draw, RF reliability, and rollback cannot be honestly certified by a desktop C compiler, despite the software industry’s recurring efforts to manifest hardware through confidence.
+The 1.0.2 OTA recovery and RF-switch power changes require the physical checks in `docs/FIELD_TEST.md`. An ESP-IDF build and physical-board validation remain mandatory because Zigbee SDK APIs, ADC behavior, current draw, RF reliability, and rollback cannot be honestly certified by a desktop C compiler, despite the software industry’s recurring efforts to manifest hardware through confidence.

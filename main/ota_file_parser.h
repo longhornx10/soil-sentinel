@@ -34,9 +34,9 @@ typedef struct esp_zb_ota_file_parser_s {
 
 esp_zb_ota_file_parser_t *esp_zb_create_ota_file_parser(uint32_t total_image_size);
 void esp_zb_free_ota_file_parser(esp_zb_ota_file_parser_t *parser);
-void esp_zb_ota_file_parser_setup(esp_zb_ota_file_parser_t *parser,
-                                  uint32_t block_size,
-                                  uint8_t *block);
+esp_err_t esp_zb_ota_file_parser_setup(esp_zb_ota_file_parser_t *parser,
+                                       uint32_t block_size,
+                                       uint8_t *block);
 bool esp_zb_ota_file_parser_is_element_value(esp_zb_ota_file_parser_t *parser);
 esp_err_t esp_zb_ota_file_parser_process(esp_zb_ota_file_parser_t *parser);
 esp_err_t esp_zb_ota_file_parser_check(esp_zb_ota_file_parser_t *parser);

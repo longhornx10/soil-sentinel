@@ -23,10 +23,10 @@ static const char *TAG = "soil-ota";
 static const esp_partition_t *s_ota_partition;
 static esp_zb_ota_file_parser_t *s_parser;
 static esp_ota_handle_t s_ota_handle;
-static soil_ota_state_t s_state = SOIL_OTA_STATE_IDLE;
-static soil_ota_result_t s_last_result = SOIL_OTA_RESULT_NONE;
-static uint8_t s_progress;
-static bool s_needs_boot_validation;
+static volatile soil_ota_state_t s_state = SOIL_OTA_STATE_IDLE;
+static volatile soil_ota_result_t s_last_result = SOIL_OTA_RESULT_NONE;
+static volatile uint8_t s_progress;
+static volatile bool s_needs_boot_validation;
 
 static void save_u8(const char *key, uint8_t value)
 {
@@ -158,8 +158,25 @@ void firmware_update_handle_query_response(ezb_zcl_ota_upgrade_query_next_image_
 {
     if (!message) return;
     if (message->in.image.status == EZB_ZCL_OTA_UPGRADE_STATUS_CODE_SUCCESS) {
-        ESP_LOGI(TAG, "OTA image offered: version=0x%08" PRIx32 " size=%" PRIu32,
-                 message->in.image.file_version, message->in.image.size);
+        /* Never trust the offer blindly: a buggy or compromised coordinator could
+         * point us at a foreign or older image. Accept only an image that matches
+         * our manufacturer code, image type, and is newer than what is running. */
+        const bool identity_ok =
+            message->in.image.manuf_code == SOIL_OTA_MANUFACTURER_CODE &&
+            message->in.image.image_type == SOIL_OTA_IMAGE_TYPE &&
+            message->in.image.file_version > firmware_update_file_version();
+        if (identity_ok) {
+            ESP_LOGI(TAG, "OTA image offered: version=0x%08" PRIx32 " size=%" PRIu32,
+                     message->in.image.file_version, message->in.image.size);
+        } else {
+            ESP_LOGW(TAG,
+                     "ignoring mismatched OTA offer: manuf=0x%04x type=0x%04x "
+                     "version=0x%08" PRIx32,
+                     message->in.image.manuf_code, message->in.image.image_type,
+                     message->in.image.file_version);
+            s_state = SOIL_OTA_STATE_IDLE;
+            set_result(SOIL_OTA_RESULT_NO_IMAGE);
+        }
         message->out.result = EZB_ZCL_STATUS_SUCCESS;
     } else {
         ESP_LOGI(TAG, "no OTA image available (status=0x%02x)",
@@ -181,6 +198,21 @@ void firmware_update_handle_progress(ezb_zcl_ota_upgrade_client_progress_message
         s_ota_partition = esp_ota_get_next_update_partition(NULL);
         ESP_GOTO_ON_FALSE(s_ota_partition, ESP_ERR_NOT_FOUND, exit, TAG,
                           "no OTA partition available");
+        /* Defense in depth on top of the query-response checks: the transfer can
+         * also start from an unsolicited Image Notify, so re-validate the image
+         * identity and size at the START progress itself. */
+        ESP_GOTO_ON_FALSE(
+            message->in.start.manuf_code == SOIL_OTA_MANUFACTURER_CODE &&
+                message->in.start.image_type == SOIL_OTA_IMAGE_TYPE &&
+                message->in.start.file_version > firmware_update_file_version(),
+            ESP_ERR_INVALID_SIZE, exit, TAG,
+            "OTA image identity mismatch (manuf=0x%04x type=0x%04x "
+            "version=0x%08" PRIx32 ")",
+            message->in.start.manuf_code, message->in.start.image_type,
+            message->in.start.file_version);
+        ESP_GOTO_ON_FALSE(message->in.start.image_size <= s_ota_partition->size,
+                          ESP_ERR_INVALID_SIZE, exit, TAG,
+                          "OTA image exceeds partition");
         s_parser = esp_zb_create_ota_file_parser(message->in.start.image_size);
         ESP_GOTO_ON_FALSE(s_parser, ESP_ERR_NO_MEM, exit, TAG,
                           "failed to allocate OTA parser");
@@ -194,9 +226,10 @@ void firmware_update_handle_progress(ezb_zcl_ota_upgrade_client_progress_message
         ESP_GOTO_ON_FALSE(s_parser && s_ota_handle && s_ota_partition,
                           ESP_ERR_INVALID_STATE, exit, TAG,
                           "OTA block received without active transfer");
-        esp_zb_ota_file_parser_setup(s_parser,
-                                     message->in.receiving.block_size,
-                                     message->in.receiving.block);
+        ESP_GOTO_ON_ERROR(esp_zb_ota_file_parser_setup(s_parser,
+                                                       message->in.receiving.block_size,
+                                                       message->in.receiving.block),
+                          exit, TAG, "invalid OTA block size");
         do {
             ret = esp_zb_ota_file_parser_process(s_parser);
             if (esp_zb_ota_file_parser_is_element_value(s_parser) &&
@@ -210,7 +243,7 @@ void firmware_update_handle_progress(ezb_zcl_ota_upgrade_client_progress_message
                                   exit, TAG, "failed to write OTA image");
             }
         } while (ret == ESP_ERR_NOT_FINISHED);
-        ret = ESP_OK;
+        ESP_GOTO_ON_ERROR(ret, exit, TAG, "OTA file parser failed");
         if (s_parser->total_image_size > 0U) {
             const uint32_t received = message->in.receiving.file_offset +
                                       message->in.receiving.block_size;
@@ -227,16 +260,21 @@ void firmware_update_handle_progress(ezb_zcl_ota_upgrade_client_progress_message
                           "Zigbee OTA container incomplete");
         break;
 
-    case EZB_ZCL_OTA_UPGRADE_PROGRESS_APPLY:
+    case EZB_ZCL_OTA_UPGRADE_PROGRESS_APPLY: {
         s_state = SOIL_OTA_STATE_APPLYING;
-        ESP_GOTO_ON_ERROR(esp_ota_end(s_ota_handle), exit, TAG,
-                          "failed to validate application image");
+        /* esp_ota_end() invalidates the handle (success or failure), so take it
+         * out of the transfer state first: cleanup_transfer() must not call
+         * esp_ota_abort() on an already-ended handle. */
+        const esp_ota_handle_t handle = s_ota_handle;
         s_ota_handle = 0;
+        ESP_GOTO_ON_ERROR(esp_ota_end(handle), exit, TAG,
+                          "failed to validate application image");
         ESP_GOTO_ON_ERROR(esp_ota_set_boot_partition(s_ota_partition), exit, TAG,
                           "failed to select OTA boot partition");
         save_u8(KEY_PENDING_SLOT,
                 s_ota_partition->subtype == ESP_PARTITION_SUBTYPE_APP_OTA_0 ? 0U : 1U);
         break;
+    }
 
     case EZB_ZCL_OTA_UPGRADE_PROGRESS_FINISH:
         s_progress = 100U;
@@ -257,6 +295,7 @@ void firmware_update_handle_progress(ezb_zcl_ota_upgrade_client_progress_message
 
     default:
         ESP_LOGW(TAG, "unknown OTA progress state %d", message->in.progress);
+        ret = ESP_ERR_NOT_SUPPORTED;
         break;
     }
 

@@ -11,6 +11,7 @@ import logging
 from typing import Any, Final
 
 import zigpy.types as t
+from zigpy.exceptions import DeliveryError
 from zigpy.zcl import foundation
 from zigpy.zcl.foundation import BaseAttributeDefs, ZCLAttributeDef
 
@@ -66,6 +67,9 @@ class SoilConfigResult(t.enum8):
     Reject_no_sample = 5
     Reject_no_learned_curve = 6
     Reject_persistence = 7
+    Reject_stale_revision = 8
+    Reject_invalid_arg = 9
+    Reject_policy = 10
 
 
 class SoilOtaState(t.enum8):
@@ -134,6 +138,7 @@ class SoilSentinelControlCluster(CustomCluster):
         super().__init__(*args, **kwargs)
         self._pending_config: dict[int, Any] | None = None
         self._pending_action: dict[int, Any] | None = None
+        self._rejected_revision: int | None = None
         self._flush_lock = asyncio.Lock()
 
     def _attribute_id(self, key: str | int | ZCLAttributeDef) -> int:
@@ -163,7 +168,7 @@ class SoilSentinelControlCluster(CustomCluster):
     async def _send_or_queue(self, payload: dict[int, Any], *, action: bool = False):
         try:
             result = await super().write_attributes(payload)
-        except Exception as exc:  # sleepy devices are expected to be absent here
+        except (asyncio.TimeoutError, DeliveryError) as exc:  # sleepy devices are expected to be absent here
             _LOGGER.debug("Soil Sentinel asleep; queued write %s: %s", payload, exc)
             if action:
                 self._pending_action = payload
@@ -174,6 +179,17 @@ class SoilSentinelControlCluster(CustomCluster):
             self._pending_action = None
         else:
             self._pending_config = None
+            for group in result:
+                for record in group:
+                    if record.status != foundation.Status.SUCCESS:
+                        self._rejected_revision = payload.get(self.DESIRED_REVISION)
+                        _LOGGER.warning(
+                            "Soil Sentinel rejected config at revision %s (%s); "
+                            "it will not be re-sent until a value is changed",
+                            self._rejected_revision,
+                            record.status,
+                        )
+                        break
         return result
 
     async def write_attributes(
@@ -190,6 +206,7 @@ class SoilSentinelControlCluster(CustomCluster):
         if not changed:
             return await super().write_attributes(attributes, **kwargs)
 
+        self._rejected_revision = None
         payload = self._build_full_config(changed)
         for attrid, value in payload.items():
             self._update_attribute(attrid, value)
@@ -198,6 +215,8 @@ class SoilSentinelControlCluster(CustomCluster):
 
     def reconstruct_pending_from_cache(self, applied_revision: int) -> None:
         desired_revision = int(self._cached(self.DESIRED_REVISION, 0))
+        if desired_revision == self._rejected_revision:
+            return
         if desired_revision <= applied_revision or self._pending_config is not None:
             return
         self._pending_config = {
@@ -268,49 +287,53 @@ class SoilSentinelTelemetryCluster(CustomCluster):
         if len(payload) != self.TELEMETRY_PAYLOAD_LENGTH or payload[0] != 2:
             return
 
-        flags = int.from_bytes(payload[2:4], "little")
-        applied_revision = int.from_bytes(payload[35:39], "little")
-        self._update_attribute(self.AttributeDefs.operating_mode.id, SoilSentinelMode(payload[1]))
-        self._update_attribute(self.AttributeDefs.report_reason.id, SoilSentinelEventFlags(flags & 0xFF))
-        self._update_attribute(self.AttributeDefs.sensor_fault.id, bool(payload[4]))
-        self._update_attribute(self.AttributeDefs.confidence.id, payload[5])
-        self._update_attribute(self.AttributeDefs.raw_probe_voltage.id, int.from_bytes(payload[6:8], "little"))
-        self._update_attribute(self.AttributeDefs.measurement_noise.id, int.from_bytes(payload[8:10], "little"))
-        self._update_attribute(self.AttributeDefs.drying_rate.id, int.from_bytes(payload[10:12], "little", signed=True))
-        self._update_attribute(self.AttributeDefs.sample_interval.id, int.from_bytes(payload[12:16], "little"))
-        self._update_attribute(self.AttributeDefs.seconds_since_watering.id, int.from_bytes(payload[16:20], "little"))
-        self._update_attribute(self.AttributeDefs.battery_present.id, bool(payload[20]))
-        self._update_attribute(self.AttributeDefs.current_sample_valid.id, bool(flags & self.STATUS_CURRENT_SAMPLE_VALID))
-        self._update_attribute(self.AttributeDefs.has_valid_moisture.id, bool(flags & self.STATUS_HAS_VALID_MOISTURE))
-        self._update_attribute(self.AttributeDefs.has_watered.id, bool(flags & self.STATUS_HAS_WATERED))
-        self._update_attribute(self.AttributeDefs.calibration_mode.id, SoilCalibrationMode(payload[21]))
-        self._update_attribute(self.AttributeDefs.active_curve_source.id, SoilCurveSource(payload[22]))
-        self._update_attribute(self.AttributeDefs.config_result.id, SoilConfigResult(payload[23]))
-        self._update_attribute(self.AttributeDefs.active_dry_voltage.id, int.from_bytes(payload[24:26], "little"))
-        self._update_attribute(self.AttributeDefs.active_wet_voltage.id, int.from_bytes(payload[26:28], "little"))
-        self._update_attribute(self.AttributeDefs.learned_dry_voltage.id, int.from_bytes(payload[28:30], "little"))
-        self._update_attribute(self.AttributeDefs.learned_wet_voltage.id, int.from_bytes(payload[30:32], "little"))
-        self._update_attribute(self.AttributeDefs.learning_confidence.id, payload[32])
-        self._update_attribute(self.AttributeDefs.learning_cycles.id, int.from_bytes(payload[33:35], "little"))
-        self._update_attribute(self.AttributeDefs.applied_config_revision.id, applied_revision)
-        self._update_attribute(self.AttributeDefs.ota_state.id, SoilOtaState(payload[39]))
-        self._update_attribute(self.AttributeDefs.ota_result.id, SoilOtaResult(payload[40]))
-        self._update_attribute(self.AttributeDefs.ota_progress.id, payload[41])
-        self._update_attribute(self.AttributeDefs.active_ota_slot.id, payload[42])
-        self._update_attribute(self.AttributeDefs.rollback_pending.id, bool(payload[43]))
-        self._update_attribute(self.AttributeDefs.firmware_file_version.id, int.from_bytes(payload[44:48], "little"))
+        try:
+            flags = int.from_bytes(payload[2:4], "little")
+            applied_revision = int.from_bytes(payload[35:39], "little")
+            self._update_attribute(self.AttributeDefs.operating_mode.id, SoilSentinelMode(payload[1]))
+            self._update_attribute(self.AttributeDefs.report_reason.id, SoilSentinelEventFlags(flags & 0xFF))
+            self._update_attribute(self.AttributeDefs.sensor_fault.id, bool(payload[4]))
+            self._update_attribute(self.AttributeDefs.confidence.id, payload[5])
+            self._update_attribute(self.AttributeDefs.raw_probe_voltage.id, int.from_bytes(payload[6:8], "little"))
+            self._update_attribute(self.AttributeDefs.measurement_noise.id, int.from_bytes(payload[8:10], "little"))
+            self._update_attribute(self.AttributeDefs.drying_rate.id, int.from_bytes(payload[10:12], "little", signed=True))
+            self._update_attribute(self.AttributeDefs.sample_interval.id, int.from_bytes(payload[12:16], "little"))
+            self._update_attribute(self.AttributeDefs.seconds_since_watering.id, int.from_bytes(payload[16:20], "little"))
+            self._update_attribute(self.AttributeDefs.battery_present.id, bool(payload[20]))
+            self._update_attribute(self.AttributeDefs.current_sample_valid.id, bool(flags & self.STATUS_CURRENT_SAMPLE_VALID))
+            self._update_attribute(self.AttributeDefs.has_valid_moisture.id, bool(flags & self.STATUS_HAS_VALID_MOISTURE))
+            self._update_attribute(self.AttributeDefs.has_watered.id, bool(flags & self.STATUS_HAS_WATERED))
+            self._update_attribute(self.AttributeDefs.calibration_mode.id, SoilCalibrationMode(payload[21]))
+            self._update_attribute(self.AttributeDefs.active_curve_source.id, SoilCurveSource(payload[22]))
+            self._update_attribute(self.AttributeDefs.config_result.id, SoilConfigResult(payload[23]))
+            self._update_attribute(self.AttributeDefs.active_dry_voltage.id, int.from_bytes(payload[24:26], "little"))
+            self._update_attribute(self.AttributeDefs.active_wet_voltage.id, int.from_bytes(payload[26:28], "little"))
+            self._update_attribute(self.AttributeDefs.learned_dry_voltage.id, int.from_bytes(payload[28:30], "little"))
+            self._update_attribute(self.AttributeDefs.learned_wet_voltage.id, int.from_bytes(payload[30:32], "little"))
+            self._update_attribute(self.AttributeDefs.learning_confidence.id, payload[32])
+            self._update_attribute(self.AttributeDefs.learning_cycles.id, int.from_bytes(payload[33:35], "little"))
+            self._update_attribute(self.AttributeDefs.applied_config_revision.id, applied_revision)
+            self._update_attribute(self.AttributeDefs.ota_state.id, SoilOtaState(payload[39]))
+            self._update_attribute(self.AttributeDefs.ota_result.id, SoilOtaResult(payload[40]))
+            self._update_attribute(self.AttributeDefs.ota_progress.id, payload[41])
+            self._update_attribute(self.AttributeDefs.active_ota_slot.id, payload[42])
+            self._update_attribute(self.AttributeDefs.rollback_pending.id, bool(payload[43]))
+            self._update_attribute(self.AttributeDefs.firmware_file_version.id, int.from_bytes(payload[44:48], "little"))
 
-        control = self.endpoint.in_clusters.get(CONTROL_CLUSTER_ID)
-        desired_revision = applied_revision
-        if isinstance(control, SoilSentinelControlCluster):
-            control._update_attribute(control.APPLIED_REVISION, applied_revision)
-            control.reconstruct_pending_from_cache(applied_revision)
-            desired_revision = int(control._attr_cache.get(control.DESIRED_REVISION, applied_revision))
-            try:
-                asyncio.get_running_loop().create_task(control.flush_pending())
-            except RuntimeError:
-                pass
-        self._update_attribute(self.AttributeDefs.configuration_pending.id, desired_revision > applied_revision)
+            control = self.endpoint.in_clusters.get(CONTROL_CLUSTER_ID)
+            desired_revision = applied_revision
+            if isinstance(control, SoilSentinelControlCluster):
+                control._update_attribute(control.APPLIED_REVISION, applied_revision)
+                control.reconstruct_pending_from_cache(applied_revision)
+                desired_revision = int(control._attr_cache.get(control.DESIRED_REVISION, applied_revision))
+                try:
+                    asyncio.get_running_loop().create_task(control.flush_pending())
+                except RuntimeError:
+                    pass
+            self._update_attribute(self.AttributeDefs.configuration_pending.id, desired_revision > applied_revision)
+        except ValueError as exc:
+            _LOGGER.warning("soil telemetry decode failed: %s", exc)
+            return
 
 
 builder = (

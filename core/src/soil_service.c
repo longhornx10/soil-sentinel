@@ -12,6 +12,9 @@ soil_service_button_action_t soil_service_classify_button(
     uint32_t factory_reset_hold_ms)
 {
     if (!pressed) return SOIL_SERVICE_BUTTON_NONE;
+    /* NOTE: callers must pass ota_hold_ms < factory_reset_hold_ms; otherwise the
+     * factory-reset check below wins for every hold length and OTA becomes
+     * unreachable. The firmware's own constants honor this (3 s vs 20 s). */
     if (hold_ms >= factory_reset_hold_ms) {
         return SOIL_SERVICE_BUTTON_FACTORY_RESET;
     }

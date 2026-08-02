@@ -54,6 +54,15 @@
 #define TELEMETRY_PAYLOAD_LENGTH 48U
 #define TELEMETRY_BUFFER_LENGTH (TELEMETRY_PAYLOAD_LENGTH + 1U)
 
+/* The length byte and the encoded schema must stay in lockstep: the last schema
+ * field (file version, 4 bytes at offset 45) must end exactly at the payload
+ * boundary. Extending the schema without updating TELEMETRY_PAYLOAD_LENGTH is
+ * now a compile error instead of a silently truncated report. */
+_Static_assert(TELEMETRY_BUFFER_LENGTH == TELEMETRY_PAYLOAD_LENGTH + 1U,
+               "telemetry buffer must hold the length byte plus the payload");
+_Static_assert((45U + 4U) == TELEMETRY_PAYLOAD_LENGTH + 1U,
+               "telemetry payload length does not match the encoded schema");
+
 #define READY_BIT BIT0
 #define REPORT_MOISTURE_CONFIRMED_BIT BIT1
 #define REPORT_MOISTURE_FAILED_BIT BIT2
@@ -85,9 +94,7 @@ static soil_policy_t *s_policy;
 static soil_state_t *s_state;
 static soil_diagnostics_t *s_diagnostics;
 
-static uint8_t s_telemetry[TELEMETRY_BUFFER_LENGTH] = {
-    TELEMETRY_PAYLOAD_LENGTH, TELEMETRY_SCHEMA_VERSION
-};
+static uint8_t s_telemetry[TELEMETRY_BUFFER_LENGTH];
 
 static uint8_t s_desired_mode;
 static uint16_t s_desired_manual_dry;
@@ -396,7 +403,11 @@ static soil_config_result_t persist_candidate(const soil_policy_t *candidate)
 static soil_config_result_t apply_desired_configuration(void)
 {
     if (!s_policy || !s_state) return SOIL_CONFIG_REJECT_PERSISTENCE;
-    if (s_desired_revision <= s_policy->config_revision) return SOIL_CONFIG_OK;
+    if (s_desired_revision <= s_policy->config_revision) {
+        /* Already current: report success through ZCL but make the model-level
+         * outcome explicit so callers can tell "applied" from "ignored". */
+        return SOIL_CONFIG_REJECT_STALE_REVISION;
+    }
 
     soil_policy_t candidate = *s_policy;
     const soil_config_result_t result = soil_policy_apply_configuration(
@@ -458,6 +469,22 @@ static soil_config_result_t apply_action(uint16_t action_bits)
     return result;
 }
 
+/* Reads a fixed-size ZCL attribute value only after verifying the wire-declared
+ * type and the registered size, so a crafted Set Attribute frame cannot cause a
+ * type-confused or out-of-bounds read. ZCL multi-octet types are little-endian
+ * on the wire; the native-width memcpy is correct because the target is LE. */
+static bool read_attr_value(const ezb_zcl_set_attr_value_message_t *message,
+                            uint8_t expected_type,
+                            void *out,
+                            size_t size)
+{
+    if (!message || !message->in.attribute.data.value || !out) return false;
+    if (message->in.attribute.data.type != expected_type) return false;
+    if (message->in.attribute.data.size < size) return false;
+    memcpy(out, message->in.attribute.data.value, size);
+    return true;
+}
+
 static void set_attr_handler(ezb_zcl_set_attr_value_message_t *message)
 {
     if (!message) return;
@@ -471,32 +498,73 @@ static void set_attr_handler(ezb_zcl_set_attr_value_message_t *message)
     }
 
     switch (message->in.attribute.id) {
-    case CTRL_ATTR_DESIRED_MODE:
-        s_desired_mode = *(uint8_t *)message->in.attribute.data.value;
+    case CTRL_ATTR_DESIRED_MODE: {
+        uint8_t value = 0U;
+        if (!read_attr_value(message, EZB_ZCL_ATTR_TYPE_ENUM8, &value, sizeof(value))) {
+            message->out.result = EZB_ZCL_STATUS_INVALID_VALUE;
+            return;
+        }
+        s_desired_mode = value;
         break;
-    case CTRL_ATTR_DESIRED_MANUAL_DRY:
-        s_desired_manual_dry = *(uint16_t *)message->in.attribute.data.value;
+    }
+    case CTRL_ATTR_DESIRED_MANUAL_DRY: {
+        uint16_t value = 0U;
+        if (!read_attr_value(message, EZB_ZCL_ATTR_TYPE_UINT16, &value, sizeof(value))) {
+            message->out.result = EZB_ZCL_STATUS_INVALID_VALUE;
+            return;
+        }
+        s_desired_manual_dry = value;
         break;
-    case CTRL_ATTR_DESIRED_MANUAL_WET:
-        s_desired_manual_wet = *(uint16_t *)message->in.attribute.data.value;
+    }
+    case CTRL_ATTR_DESIRED_MANUAL_WET: {
+        uint16_t value = 0U;
+        if (!read_attr_value(message, EZB_ZCL_ATTR_TYPE_UINT16, &value, sizeof(value))) {
+            message->out.result = EZB_ZCL_STATUS_INVALID_VALUE;
+            return;
+        }
+        s_desired_manual_wet = value;
         break;
-    case CTRL_ATTR_DESIRED_DRY_THRESHOLD:
-        s_desired_dry_threshold = *(uint8_t *)message->in.attribute.data.value;
+    }
+    case CTRL_ATTR_DESIRED_DRY_THRESHOLD: {
+        uint8_t value = 0U;
+        if (!read_attr_value(message, EZB_ZCL_ATTR_TYPE_UINT8, &value, sizeof(value))) {
+            message->out.result = EZB_ZCL_STATUS_INVALID_VALUE;
+            return;
+        }
+        s_desired_dry_threshold = value;
         break;
-    case CTRL_ATTR_DESIRED_CRIT_THRESHOLD:
-        s_desired_critical_threshold = *(uint8_t *)message->in.attribute.data.value;
+    }
+    case CTRL_ATTR_DESIRED_CRIT_THRESHOLD: {
+        uint8_t value = 0U;
+        if (!read_attr_value(message, EZB_ZCL_ATTR_TYPE_UINT8, &value, sizeof(value))) {
+            message->out.result = EZB_ZCL_STATUS_INVALID_VALUE;
+            return;
+        }
+        s_desired_critical_threshold = value;
         break;
+    }
     case CTRL_ATTR_DESIRED_REVISION: {
-        s_desired_revision = *(uint32_t *)message->in.attribute.data.value;
+        uint32_t value = 0U;
+        if (!read_attr_value(message, EZB_ZCL_ATTR_TYPE_UINT32, &value, sizeof(value))) {
+            message->out.result = EZB_ZCL_STATUS_INVALID_VALUE;
+            return;
+        }
+        s_desired_revision = value;
         const soil_config_result_t result = apply_desired_configuration();
-        message->out.result = result == SOIL_CONFIG_OK
+        message->out.result = result == SOIL_CONFIG_OK ||
+                                      result == SOIL_CONFIG_REJECT_STALE_REVISION
                                   ? EZB_ZCL_STATUS_SUCCESS
                                   : EZB_ZCL_STATUS_INVALID_VALUE;
         sync_control_cluster();
         break;
     }
     case CTRL_ATTR_ACTION: {
-        s_action = *(uint16_t *)message->in.attribute.data.value;
+        uint16_t value = 0U;
+        if (!read_attr_value(message, EZB_ZCL_ATTR_TYPE_BITMAP16, &value, sizeof(value))) {
+            message->out.result = EZB_ZCL_STATUS_INVALID_VALUE;
+            return;
+        }
+        s_action = value;
         const soil_config_result_t result = apply_action(s_action);
         message->out.result = result == SOIL_CONFIG_OK
                                   ? EZB_ZCL_STATUS_SUCCESS
@@ -782,6 +850,26 @@ bool zigbee_transport_wait_ready(uint32_t timeout_ms)
     return (bits & READY_BIT) != 0U;
 }
 
+esp_err_t zigbee_transport_deinit(void)
+{
+    /* Tear down the Zigbee stack before the caller erases its NVS partition or
+     * reboots; erasing flash under a live stack driver is undefined behavior. */
+    if (!s_events) return ESP_OK;
+    return esp_zigbee_deinit();
+}
+
+esp_err_t zigbee_transport_read_battery_mv(float *battery_mv)
+{
+    /* Sample the battery with the Zigbee lock held so the stack task cannot
+     * start a radio transmission that sags the terminal voltage into the ADC
+     * window and produces a spurious low-battery refusal. */
+    if (!battery_mv) return ESP_ERR_INVALID_ARG;
+    if (!acquire_zigbee_lock("battery read")) return ESP_ERR_TIMEOUT;
+    const esp_err_t err = board_read_battery_mv(battery_mv);
+    esp_zigbee_lock_release();
+    return err;
+}
+
 static void report_confirm_callback(ezb_af_user_cnf_t *cnf, void *user_ctx)
 {
     report_confirm_context_t *ctx = (report_confirm_context_t *)user_ctx;
@@ -839,14 +927,17 @@ esp_err_t zigbee_transport_publish(const soil_state_t *state,
     xEventGroupClearBits(s_events, report_bits);
 
     const float moisture = state->current_sample_valid ? state->moisture_pct : NAN;
-    s_attr_battery_percentage = clamp_u8(state->battery_pct * 2.0f);
-    s_attr_battery_voltage = clamp_u8(diag->battery_mv / 100.0f);
     const uint8_t status_flags = state->sensor_fault ? 0x02U
                                  : state->mode == SOIL_MODE_CRITICAL ? 0x01U
                                                                      : 0x00U;
-    encode_telemetry(state, diag);
 
     if (!acquire_zigbee_lock("state publish")) return ESP_ERR_TIMEOUT;
+    /* The telemetry attribute is reportable, so the stack task can build reports
+     * from s_telemetry/s_attr_* at any time: only touch them while holding the
+     * Zigbee lock so a concurrent report never observes a torn buffer. */
+    s_attr_battery_percentage = clamp_u8(state->battery_pct * 2.0f);
+    s_attr_battery_voltage = clamp_u8(diag->battery_mv / 100.0f);
+    encode_telemetry(state, diag);
     sync_control_cluster();
     const ezb_zcl_status_t moisture_status = ezb_zcl_set_attr_value(
         ENDPOINT_ID, EZB_ZCL_CLUSTER_ID_ANALOG_INPUT, EZB_ZCL_CLUSTER_SERVER,

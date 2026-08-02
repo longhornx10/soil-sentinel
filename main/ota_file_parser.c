@@ -20,13 +20,31 @@ void esp_zb_free_ota_file_parser(esp_zb_ota_file_parser_t *parser)
     free(parser);
 }
 
-void esp_zb_ota_file_parser_setup(esp_zb_ota_file_parser_t *parser,
-                                  uint32_t block_size,
-                                  uint8_t *block)
+esp_err_t esp_zb_ota_file_parser_setup(esp_zb_ota_file_parser_t *parser,
+                                       uint32_t block_size,
+                                       uint8_t *block)
 {
-    if (!parser) return;
+    if (!parser || !block || block_size == 0U || block_size > UINT16_MAX) {
+        return ESP_ERR_INVALID_ARG;
+    }
     parser->in = block;
     parser->in_length = (uint16_t)block_size;
+    return ESP_OK;
+}
+
+static uint16_t optional_header_size(uint8_t field_control)
+{
+    uint16_t size = 0U;
+    if (field_control & EZB_ZCL_OTA_FILE_HEADER_FC_SECURITY_CREDENTIAL_VERSION_PRESENT) {
+        size += sizeof(uint8_t);
+    }
+    if (field_control & EZB_ZCL_OTA_FILE_HEADER_FC_DEVICE_SPECIFIC) {
+        size += sizeof(ezb_extaddr_t);
+    }
+    if (field_control & EZB_ZCL_OTA_FILE_HEADER_FC_HW_VERSION_PRESENT) {
+        size += sizeof(uint16_t) + sizeof(uint16_t);
+    }
+    return size;
 }
 
 bool esp_zb_ota_file_parser_is_element_value(esp_zb_ota_file_parser_t *parser)
@@ -106,10 +124,23 @@ esp_err_t esp_zb_ota_file_parser_process(esp_zb_ota_file_parser_t *parser)
     }
 
     if (parser->header.mandatory.hdr_length > parser->total_offset) {
+        /* hdr_length comes from the untrusted image header: without bounds it
+         * drives a memcpy far past the 13-byte optional struct into the heap.
+         * Reject headers whose optional region exceeds the struct, underflows
+         * the mandatory size, or is too small for the field-control bits. */
+        const uint16_t mandatory_size = (uint16_t)sizeof(parser->header.mandatory);
+        const uint16_t optional_total =
+            (uint16_t)(parser->header.mandatory.hdr_length - mandatory_size);
+        if (parser->header.mandatory.hdr_length < mandatory_size ||
+            optional_total > (uint16_t)sizeof(parser->header.optional) ||
+            optional_total < optional_header_size(parser->header.mandatory.hdr_fc)) {
+            parser->element.length = 0U;
+            parser->element.val = NULL;
+            return ESP_ERR_INVALID_SIZE;
+        }
         written = stream_copy((uint8_t *)&parser->header.optional,
                               (uint16_t)parser->offset,
-                              (uint16_t)(parser->header.mandatory.hdr_length -
-                                         sizeof(parser->header.mandatory)),
+                              optional_total,
                               parser->in,
                               parser->in_length);
         parser_advance(parser, written);

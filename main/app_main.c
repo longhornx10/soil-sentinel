@@ -166,7 +166,16 @@ static void save_state(const soil_policy_t *policy,
     }
     storage_save_runtime(state);
     if ((state->event_flags & CHECKPOINT_EVENT_MASK) != 0U) {
-        (void)storage_save_checkpoint(policy, state);
+        if (storage_save_checkpoint(policy, state) != ESP_OK) {
+            ESP_LOGW(TAG, "failed to persist state checkpoint");
+        }
+    }
+}
+
+static void save_checkpoint_or_log(const soil_policy_t *policy, const soil_state_t *state)
+{
+    if (storage_save_checkpoint(policy, state) != ESP_OK) {
+        ESP_LOGW(TAG, "failed to persist configuration checkpoint");
     }
 }
 
@@ -193,7 +202,7 @@ static esp_err_t service_queued_configuration(soil_policy_t *policy,
     if (zigbee_transport_wait_config_change(CONFIG_DELIVERY_WINDOW_MS)) {
         refresh_current_moisture(policy, state, measurement);
         final_err = publish_with_retry(state, measurement);
-        (void)storage_save_checkpoint(policy, state);
+        save_checkpoint_or_log(policy, state);
     }
     if (zigbee_transport_take_identify_request()) {
         board_indicator_identify();
@@ -249,7 +258,16 @@ static void run_ota_service_window(soil_policy_t *policy,
         if (battery_recheck_ms >= OTA_BATTERY_RECHECK_MS && state->battery_present) {
             float loaded_battery_mv = measurement->battery_mv;
             battery_recheck_ms = 0U;
-            if (board_read_battery_mv(&loaded_battery_mv) != ESP_OK ||
+            /* Read with the Zigbee lock held: a TX burst would transiently sag a
+             * single AA cell into the ADC window and spuriously abort the OTA. */
+            const esp_err_t battery_err =
+                zigbee_transport_read_battery_mv(&loaded_battery_mv);
+            if (battery_err == ESP_ERR_TIMEOUT) {
+                /* Lock busy (stack mid-transfer): not a battery verdict. Skip
+                 * this recheck tick instead of aborting the OTA. */
+                continue;
+            }
+            if (battery_err != ESP_OK ||
                 loaded_battery_mv < SOIL_OTA_MIN_BATTERY_MV) {
                 measurement->battery_mv = loaded_battery_mv;
                 firmware_update_refuse_low_battery();
@@ -262,7 +280,7 @@ static void run_ota_service_window(soil_policy_t *policy,
         if (zigbee_transport_wait_config_change(0U)) {
             refresh_current_moisture(policy, state, measurement);
             (void)publish_with_retry(state, measurement);
-            (void)storage_save_checkpoint(policy, state);
+            save_checkpoint_or_log(policy, state);
         }
         if (zigbee_transport_take_identify_request()) board_indicator_identify();
 
@@ -351,7 +369,7 @@ static void stay_awake_for_usb(soil_policy_t *policy,
                 if (board_measure(&current) == ESP_OK) {
                     refresh_current_moisture(policy, state, &current);
                     (void)publish_with_retry(state, &current);
-                    (void)storage_save_checkpoint(policy, state);
+                    save_checkpoint_or_log(policy, state);
                 }
             }
             if (zigbee_transport_take_identify_request()) board_indicator_identify();
@@ -361,6 +379,9 @@ static void stay_awake_for_usb(soil_policy_t *policy,
         battery_recheck_ms = 0U;
         const button_action_t action = classify_button_hold(0.0f, false);
         if (action == BUTTON_ACTION_FACTORY_RESET) {
+            /* Tear the Zigbee stack down before erasing its NVS partition: erasing
+             * flash under a live stack driver is undefined behavior. */
+            (void)zigbee_transport_deinit();
             (void)storage_factory_reset(true);
             esp_restart();
         }
@@ -477,6 +498,7 @@ void app_main(void)
     const bool need_zigbee = state.should_report || usb_without_battery ||
                               ota_mode || validation_boot;
     bool zigbee_ready = false;
+    bool ota_cancelled = false;
     esp_err_t publish_err = ESP_OK;
 
     if (need_zigbee) {
@@ -493,7 +515,28 @@ void app_main(void)
         } else if (cold_boot) {
             wait_ms = COLD_BOOT_ZIGBEE_WAIT_MS;
         }
-        zigbee_ready = zigbee_transport_wait_ready(wait_ms);
+        if (ota_mode) {
+            /* Poll the button during the readiness wait too: the docs promise a
+             * press cancels OTA immediately, including the pre-window wait. */
+            uint32_t waited_ms = 0U;
+            while (waited_ms < wait_ms) {
+                if (ota_cancel_requested()) {
+                    ESP_LOGW(TAG, "OTA cancelled during Zigbee readiness wait");
+                    ota_cancelled = true;
+                    break;
+                }
+                const uint32_t step_ms = wait_ms - waited_ms < 250U
+                                             ? wait_ms - waited_ms
+                                             : 250U;
+                if (zigbee_transport_wait_ready(step_ms)) {
+                    zigbee_ready = true;
+                    break;
+                }
+                waited_ms += step_ms;
+            }
+        } else {
+            zigbee_ready = zigbee_transport_wait_ready(wait_ms);
+        }
         if (zigbee_ready) {
             const bool paired_now = board_pairing_indicator_is_success();
             publish_err = publish_with_retry(&state, &measurement);
@@ -514,10 +557,21 @@ void app_main(void)
 
             if (ota_mode) {
                 float loaded_battery_mv = measurement.battery_mv;
-                const bool loaded_battery_safe =
-                    !state.battery_present ||
-                    (board_read_battery_mv(&loaded_battery_mv) == ESP_OK &&
-                     loaded_battery_mv >= SOIL_OTA_MIN_BATTERY_MV);
+                const esp_err_t battery_err =
+                    zigbee_transport_read_battery_mv(&loaded_battery_mv);
+                bool loaded_battery_safe;
+                if (battery_err == ESP_ERR_TIMEOUT) {
+                    /* Lock busy: not a battery verdict. Fall back to the boot-time
+                     * measurement taken with the radio idle instead of refusing. */
+                    loaded_battery_safe =
+                        !state.battery_present ||
+                        measurement.battery_mv >= SOIL_OTA_MIN_BATTERY_MV;
+                } else {
+                    loaded_battery_safe =
+                        !state.battery_present ||
+                        (battery_err == ESP_OK &&
+                         loaded_battery_mv >= SOIL_OTA_MIN_BATTERY_MV);
+                }
                 if (!loaded_battery_safe) {
                     firmware_update_refuse_low_battery();
                     board_indicator_ota_low_battery();
@@ -532,13 +586,15 @@ void app_main(void)
                 vTaskDelay(pdMS_TO_TICKS(REPORT_SETTLE_MS));
             }
         } else {
-            publish_err = ESP_ERR_TIMEOUT;
-            if (ota_mode) {
-                firmware_update_timeout();
-                board_indicator_ota_failure();
-            }
-            if (!usb_without_battery && state.sample_interval_seconds < 3600U) {
-                state.sample_interval_seconds = 3600U;
+            if (!ota_cancelled) {
+                publish_err = ESP_ERR_TIMEOUT;
+                if (ota_mode) {
+                    firmware_update_timeout();
+                    board_indicator_ota_failure();
+                }
+                if (!usb_without_battery && state.sample_interval_seconds < 3600U) {
+                    state.sample_interval_seconds = 3600U;
+                }
             }
         }
     }
